@@ -37,8 +37,11 @@ The public datasets employed in the paper are listed below.
 These dataset folders/files follow its original structure.
 
 - MVTec AD ([Download link](https://www.mvtec.com/company/research/datasets/mvtec-ad/))
+- MVTec AD 2 ([Download link](https://www.mvtec.com/company/research/datasets/mvtec-ad-2/))
 - VisA ([Download link](https://github.com/amazon-science/spot-diff/))
 - MPDD ([Download link](https://github.com/stepanje/MPDD/))
+- BTAD ([Download link](https://datasetninja.com/btad/))
+- Real-IAD ([Download link](https://huggingface.co/datasets/Real-IAD/Real-IAD/tree/main/realiad_512/))
 
 ## Run Experiments
 For example, edit `./shell/run-mvtec.sh` to configure arguments `--datapath`, `--classes`, and hyperparameter settings.
