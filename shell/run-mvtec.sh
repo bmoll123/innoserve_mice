@@ -1,5 +1,8 @@
-datapath=/root/cqy/dataset/MVTec
+#!/bin/bash
+
+datapath=/home/undergraduate/liwei/GLASS/cqy/dataset/MVTec
 classes=('carpet' 'grid' 'leather' 'tile' 'wood' 'bottle' 'cable' 'capsule' 'hazelnut' 'metal_nut' 'pill' 'screw' 'toothbrush' 'transistor' 'zipper')
+
 flags=($(for class in "${classes[@]}"; do echo '-d '"${class}"; done))
 
 cd ..
@@ -17,9 +20,11 @@ python main.py \
     --meta_epochs 640 \
     --eval_epochs 1 \
     --dsc_layers 2 \
-    --dsc_hidden 1024 \
+    --dsc_hidden 1536 \
     --pre_proj 1 \
     --k 0.25 \
+    --n_neighbors 9 \
+    --tangent_ratio 0.2 \
   dataset \
     --batch_size 8 \
     --resize 288 \

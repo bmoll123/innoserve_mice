@@ -1,8 +1,8 @@
 #!/bin/bash
 
-datapath=/home/undergraduate/liwei/GLASS/cqy/dataset/VisA
+datapath=/home/undergraduate/liwei/GLASS/cqy/dataset/mvtec_ad_2
+classes=('can' 'fabric' 'fruit_jelly' 'rice' 'sheet_metal' 'vial' 'wallplugs' 'walnuts')
 
-classes=('candle' 'capsules' 'cashew' 'chewinggum' 'fryum' 'macaroni1' 'macaroni2' 'pcb1' 'pcb2' 'pcb3' 'pcb4' 'pipe_fryum')
 flags=($(for class in "${classes[@]}"; do echo '-d '"${class}"; done))
 
 cd ..
@@ -20,13 +20,12 @@ python main.py \
     --meta_epochs 640 \
     --eval_epochs 1 \
     --dsc_layers 2 \
-    --dsc_hidden 1024 \
+    --dsc_hidden 1536 \
     --pre_proj 1 \
     --k 0.25 \
     --n_neighbors 9 \
     --tangent_ratio 0.2 \
-    --limit 392 \
   dataset \
     --batch_size 8 \
     --resize 288 \
-    --imagesize 288 "${flags[@]}" visa $datapath
+    --imagesize 288 "${flags[@]}" mvtec2 $datapath
