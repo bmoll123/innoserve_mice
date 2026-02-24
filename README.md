@@ -25,7 +25,7 @@ Here, we present a brief summary of PBAS's performance across several benchmark 
 ## Environments
 Create a new conda environment and install required packages.
 ```
-conda create -n mice_env python=3.10
+conda create -n mice_env python=3.11.5
 conda activate mice_env
 pip install -r requirements.txt
 ```
