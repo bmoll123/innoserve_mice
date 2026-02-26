@@ -20,7 +20,7 @@ python main.py \
     --meta_epochs 640 \
     --eval_epochs 1 \
     --dsc_layers 2 \
-    --dsc_hidden 1536 \
+    --dsc_hidden 1024 \
     --pre_proj 1 \
     --k 0.25 \
     --n_neighbors 9 \
