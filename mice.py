@@ -190,7 +190,9 @@ class MICE(torch.nn.Module):
                     for k, v in self.pre_projection.state_dict().items()})
 
         # 計算 Params 與 FLOPs
-        dummy_input = torch.randn(1, 3, 288, 288).to(self.device)        
+        dummy_input = torch.randn(1, 3, 288, 288).to(self.device)
+        
+        # 計算參數量 (Parameters) - 以百萬 (M) 為單位
         total_params = sum(p.numel() for p in self.discriminator.parameters())
         if self.pre_proj > 0:
             total_params += sum(p.numel() for p in self.pre_projection.parameters())
@@ -220,24 +222,38 @@ class MICE(torch.nn.Module):
 
         LOGGER.info("Initializing Memory Bank for Manifold Interpolation...")
         bank_features = []
+
+        patches_per_image = 300 
         with torch.no_grad():
             for i, data in enumerate(tqdm.tqdm(train_data, desc="Building Memory Bank")):
                 img = data["image"]
                 img = img.to(torch.float).to(self.device)
+                
+                # 取得特徵 Embedding
                 if self.pre_proj > 0:
                     outputs = self.pre_projection(self._embed(img, evaluation=False)[0])
                 else:
                     outputs = self._embed(img, evaluation=False)[0]
                 
+                # Reshape 成 (N_patches, Feature_Dim)
                 outputs = outputs.reshape(img.shape[0], -1, outputs.shape[-1]) 
                 outputs = outputs.reshape(-1, outputs.shape[-1])
+
+                # 特徵抽樣 (Subsampling)
+                if outputs.shape[0] > patches_per_image:
+                    indices = torch.randperm(outputs.shape[0])[:patches_per_image]
+                    outputs = outputs[indices]
+
                 bank_features.append(outputs.cpu())
             
+            # 合併特徵庫
             self.memory_bank = torch.cat(bank_features, dim=0)
+            
             bank_path = os.path.join(self.ckpt_dir, "memory_bank.pth")
             torch.save(self.memory_bank, bank_path)
             LOGGER.info(f"Memory Bank initialized with shape: {self.memory_bank.shape}")
-            self.memory_bank = self.memory_bank.to(self.device)
+
+            self.memory_bank = self.memory_bank.cpu()
 
         pbar = tqdm.tqdm(range(self.meta_epochs), unit='epoch')
         pbar_str1 = ""
@@ -263,7 +279,7 @@ class MICE(torch.nn.Module):
             if (i_epoch + 1) % self.eval_epochs == 0:
                 images, scores, segmentations, labels_gt, masks_gt = self.predict(test_data)
                 image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro = self._evaluate(images, scores, segmentations,
-                                                                                         labels_gt, masks_gt, name)
+                                                                                        labels_gt, masks_gt, name)
                 
                 current_i_auroc = image_auroc
                 current_p_auroc = pixel_auroc
@@ -313,11 +329,10 @@ class MICE(torch.nn.Module):
             print(f" 6. Best Pixel AUROC : {best_pix_auroc * 100:.2f} % (at Epoch {best_epoch})")
         print("="*40 + "\n")
 
-        # 輸出到 final_best_results.txt
         final_txt_path = os.path.join(analyze_dir, "final_best_results.txt")
         result_line = (f"[{name}] Best_I-AUROC: {best_img_auroc:.4f}, Best_P-AUROC: {best_pix_auroc:.4f}, "
-                       f"Time/Epoch: {avg_epoch_time:.4f}s, Latency: {avg_perturb_time_overall:.4f}ms, "
-                       f"Params: {params_str}, FLOPs: {flops_str}, TotalTime: {total_training_duration:.2f}s\n")
+                    f"Time/Epoch: {avg_epoch_time:.4f}s, Latency: {avg_perturb_time_overall:.4f}ms, "
+                    f"Params: {params_str}, FLOPs: {flops_str}, TotalTime: {total_training_duration:.2f}s\n")
         
         with open(final_txt_path, "a") as f:
             f.write(result_line)
@@ -351,13 +366,13 @@ class MICE(torch.nn.Module):
             else:
                 true_feats = self._embed(img, evaluation=False)[0]
 
-            # Manifold Interpolation Logic
             if self.memory_bank.shape[0] > bank_subset_size:
                 indices = torch.randperm(self.memory_bank.shape[0])[:bank_subset_size]
-                ref_bank = self.memory_bank[indices]
+                ref_bank = self.memory_bank[indices].to(self.device)
             else:
-                ref_bank = self.memory_bank
-
+                ref_bank = self.memory_bank.to(self.device)
+            
+            # 開始計時 Perturbation Latency
             t0_perturb = time.time()
             
             dist_matrix = torch.cdist(true_feats, ref_bank)
@@ -371,7 +386,7 @@ class MICE(torch.nn.Module):
             # 1. 計算當前特徵與選中鄰居之間的歐式距離
             dist_pairs = torch.norm(true_feats - selected_neighbors, dim=1, keepdim=True)
             
-            # 2. 設定動態閾值 (Dynamic Threshold) - 以距離的 90% 分位數作為閾值
+            # 2. 設定動態閾值 (例如: 取當前 Batch 距離分佈的 90 百分位數)
             mixup_threshold = torch.quantile(dist_pairs, 0.9)
 
             # 3. 初始隨機 Lambda [0, 0.5]
@@ -413,7 +428,7 @@ class MICE(torch.nn.Module):
             # 距離 = r_ct * self.k
             perturbation = (displacement * r_ct * self.k).detach()
             fake_feats = true_feats + perturbation
-            
+
             t1_perturb = time.time()
             batch_perturb_times.append((t1_perturb - t0_perturb) * 1000) # 轉換為 ms
 
