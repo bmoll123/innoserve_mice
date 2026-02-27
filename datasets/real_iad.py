@@ -153,22 +153,22 @@ class RealIADDataset(torch.utils.data.Dataset):
                 # 遞迴搜尋該 NG 類別下的所有子資料夾
                 for root, dirs, files in os.walk(type_path):
                     for f in sorted(files):
-                        if f.lower().endswith(('.jpg', '.jpeg')):
-                            img_path = os.path.join(root, f)
-                            
+                        # 以 mask (.png) 為基準來尋找 RGB (.jpg)
+                        if f.lower().endswith('.png'):
+                            mask_path = os.path.join(root, f)
                             fname_no_ext = os.path.splitext(f)[0]
-                            mask_name = fname_no_ext + ".png"
-                            mask_path = os.path.join(root, mask_name)
-                            
-                            if not os.path.exists(mask_path):
-                                mask_path_jpg = os.path.join(root, fname_no_ext + ".jpg")
-                                if os.path.exists(mask_path_jpg) and mask_path_jpg != img_path:
-                                    mask_path = mask_path_jpg
-                                else:
-                                    mask_path = None
 
-                            if mask_path is None:
-                                continue
+                            img_path = os.path.join(root, fname_no_ext + ".jpg")
+
+                            if not os.path.exists(img_path):
+                                img_path_jpeg = os.path.join(root, fname_no_ext + ".jpeg")
+                                img_path_JPG = os.path.join(root, fname_no_ext + ".JPG") # 處理大寫副檔名
+                                if os.path.exists(img_path_jpeg):
+                                    img_path = img_path_jpeg
+                                elif os.path.exists(img_path_JPG):
+                                    img_path = img_path_JPG
+                                else:
+                                    continue
 
                             ng_samples.append((anomaly_type, img_path, mask_path))
 

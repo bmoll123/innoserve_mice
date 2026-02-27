@@ -539,14 +539,27 @@ class MICE(torch.nn.Module):
 
         defects = images 
         targets = masks_gt
-        
         save_limit = min(len(defects), 50) 
-        
-        for i in range(save_limit):
-            defect = utils.torch_format_2_numpy_img(defects[i])
-            target = utils.torch_format_2_numpy_img(targets[i])
 
-            mask = cv2.cvtColor(cv2.resize(segmentations[i], (defect.shape[1], defect.shape[0])),
+        ng_indices = [i for i, target in enumerate(targets) if target.sum() > 0]
+        ok_indices = [i for i, target in enumerate(targets) if target.sum() == 0]
+
+        half_limit = save_limit // 2
+        ok_take = min(len(ok_indices), half_limit)
+        ng_take = min(len(ng_indices), half_limit)
+
+        if ok_take < half_limit:
+            ng_take = min(len(ng_indices), save_limit - ok_take)
+        elif ng_take < half_limit:
+            ok_take = min(len(ok_indices), save_limit - ng_take)
+
+        save_indices = ok_indices[:ok_take] + ng_indices[:ng_take]
+        
+        for idx, orig_idx in enumerate(save_indices):
+            defect = utils.torch_format_2_numpy_img(defects[orig_idx])
+            target = utils.torch_format_2_numpy_img(targets[orig_idx])
+
+            mask = cv2.cvtColor(cv2.resize(segmentations[orig_idx], (defect.shape[1], defect.shape[0])),
                                 cv2.COLOR_GRAY2BGR)
             mask = (mask * 255).astype('uint8')
             mask = cv2.applyColorMap(mask, cv2.COLORMAP_JET)
@@ -555,7 +568,9 @@ class MICE(torch.nn.Module):
             img_up = cv2.resize(img_up, (256 * 3, 256))
             full_path = './results/' + path + '/' + name + '/'
             utils.del_remake_dir(full_path, del_flag=False)
-            cv2.imwrite(full_path + str(i + 1).zfill(3) + '.png', img_up)
+
+            label_str = "NG" if orig_idx in ng_indices else "OK"
+            cv2.imwrite(full_path + str(idx + 1).zfill(3) + f'_{label_str}_img{orig_idx}.png', img_up)
 
         return image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro
 
