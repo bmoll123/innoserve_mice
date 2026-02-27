@@ -539,12 +539,14 @@ class MICE(torch.nn.Module):
 
         defects = images 
         targets = masks_gt
+
         save_limit = min(len(defects), 50) 
 
         ng_indices = [i for i, target in enumerate(targets) if target.sum() > 0]
         ok_indices = [i for i, target in enumerate(targets) if target.sum() == 0]
 
         half_limit = save_limit // 2
+
         ok_take = min(len(ok_indices), half_limit)
         ng_take = min(len(ng_indices), half_limit)
 
@@ -556,10 +558,15 @@ class MICE(torch.nn.Module):
         save_indices = ok_indices[:ok_take] + ng_indices[:ng_take]
         
         for idx, orig_idx in enumerate(save_indices):
-            defect = utils.torch_format_2_numpy_img(defects[orig_idx])
-            target = utils.torch_format_2_numpy_img(targets[orig_idx])
+            defect = defects[orig_idx]
+            
+            target_mask = targets[orig_idx].astype(np.uint8)
+            if target_mask.shape[0] == 1:
+                target_mask = target_mask.transpose([1, 2, 0])
+                target_mask = np.repeat(target_mask, 3, axis=-1)
+            target = target_mask * 255
 
-            mask = cv2.cvtColor(cv2.resize(segmentations[orig_idx], (defect.shape[1], defect.shape[0])),
+            mask = cv2.cvtColor(cv2.resize(segmentations[orig_idx].astype(np.float32), (defect.shape[1], defect.shape[0])),
                                 cv2.COLOR_GRAY2BGR)
             mask = (mask * 255).astype('uint8')
             mask = cv2.applyColorMap(mask, cv2.COLORMAP_JET)
@@ -590,16 +597,19 @@ class MICE(torch.nn.Module):
                 if isinstance(data, dict):
                     labels_gt.extend(data["is_anomaly"].cpu().numpy())
                     if data.get("mask_gt", None) is not None:
-                        masks_gt.append(data["mask_gt"].cpu().numpy()) 
+                        masks_gt.append(data["mask_gt"].cpu().numpy().astype(np.bool_)) 
                     image = data["image"]
-                    images.append(image.cpu().numpy()) 
+                    
+                    for img_arr in image.cpu().numpy():
+                        images.append(utils.torch_format_2_numpy_img(img_arr))
+                        
                     img_paths.extend(data["image_path"])
                 _scores, _masks = self._predict(image)
                 scores.extend(_scores)
-                masks.extend(_masks)
+                
+                # 將預測的 mask 轉為 float16
+                masks.extend([m.astype(np.float16) for m in _masks])
 
-        if len(images) > 0:
-            images = np.concatenate(images, axis=0)
         if len(masks_gt) > 0:
             masks_gt = np.concatenate(masks_gt, axis=0)
 
