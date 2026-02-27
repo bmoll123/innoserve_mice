@@ -108,7 +108,7 @@ def net(
 @click.argument("data_path", type=click.Path(exists=True, file_okay=False))
 @click.option("--subdatasets", "-d", multiple=True, type=str, required=True)
 @click.option("--batch_size", default=8, type=int, show_default=True)
-@click.option("--num_workers", default=8, type=int, show_default=True)
+@click.option("--num_workers", default=4, type=int, show_default=True)
 @click.option("--resize", default=288, type=int, show_default=True)
 @click.option("--imagesize", default=288, type=int, show_default=True)
 def dataset(
