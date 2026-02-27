@@ -537,9 +537,12 @@ class MICE(torch.nn.Module):
         else:
             pixel_pro = 0.
 
-        defects = np.array(images)
-        targets = np.array(masks_gt)
-        for i in range(len(defects)):
+        defects = images 
+        targets = masks_gt
+        
+        save_limit = min(len(defects), 50) 
+        
+        for i in range(save_limit):
             defect = utils.torch_format_2_numpy_img(defects[i])
             target = utils.torch_format_2_numpy_img(targets[i])
 
@@ -570,16 +573,20 @@ class MICE(torch.nn.Module):
         with tqdm.tqdm(test_dataloader, desc="Inferring...", leave=False, unit='batch') as data_iterator:
             for data in data_iterator:
                 if isinstance(data, dict):
-                    labels_gt.extend(data["is_anomaly"].numpy().tolist())
+                    labels_gt.extend(data["is_anomaly"].cpu().numpy())
                     if data.get("mask_gt", None) is not None:
-                        masks_gt.extend(data["mask_gt"].numpy().tolist())
+                        masks_gt.append(data["mask_gt"].cpu().numpy()) 
                     image = data["image"]
-                    images.extend(image.numpy().tolist())
+                    images.append(image.cpu().numpy()) 
                     img_paths.extend(data["image_path"])
                 _scores, _masks = self._predict(image)
-                for score, mask in zip(_scores, _masks):
-                    scores.append(score)
-                    masks.append(mask)
+                scores.extend(_scores)
+                masks.extend(_masks)
+
+        if len(images) > 0:
+            images = np.concatenate(images, axis=0)
+        if len(masks_gt) > 0:
+            masks_gt = np.concatenate(masks_gt, axis=0)
 
         return images, scores, masks, labels_gt, masks_gt
 
