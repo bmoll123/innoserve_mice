@@ -67,6 +67,7 @@ class RealIADDataset(torch.utils.data.Dataset):
         self.split = split
         self.resize = resize
         self.imgsize = imagesize
+        self.imagesize = (3, self.imgsize, self.imgsize)
         self.classname = classname
         self.split_ratio = split_ratio
         self.seed = seed

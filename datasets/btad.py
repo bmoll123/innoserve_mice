@@ -34,6 +34,7 @@ class BTADDataset(torch.utils.data.Dataset):
         self.split = split
         self.resize = resize
         self.imgsize = imagesize
+        self.imagesize = (3, self.imgsize, self.imgsize)
         self.classname = classname
 
         self.imgpaths_per_class, self.data_to_iterate = self.get_image_data()
