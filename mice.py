@@ -63,6 +63,9 @@ class MICE(torch.nn.Module):
             n_neighbors=9,
             tangent_ratio=0.2,
             limit=392,
+            top_k=1,
+            thr_mode="fixed",
+            thr_percentile=99.0,
             **kwargs,
     ):
         self.backbone = backbone.to(device)
@@ -104,6 +107,12 @@ class MICE(torch.nn.Module):
         self.discriminator.to(self.device)
         self.dsc_opt = torch.optim.AdamW(self.discriminator.parameters(), lr=self.dsc_lr)
         self.dsc_margin = dsc_margin
+        # dsc_margin 同時是訓練統計 (pt/pf) 的門檻與分類判定門檻。
+        # thr_mode='percentile' 時，判定門檻改由訓練集 (全正常) 的分數分布決定，
+        # self.dsc_margin 仍然維持原值給 pt/pf 用。
+        self.thr_mode = thr_mode
+        self.thr_percentile = thr_percentile
+        self.threshold = dsc_margin
 
         self.n_neighbors = n_neighbors
         self.tangent_ratio = tangent_ratio
@@ -111,13 +120,16 @@ class MICE(torch.nn.Module):
         self.k = k
         self.limit = limit
 
-        self.patch_maker = PatchMaker(patchsize, stride=patchstride)
+        self.patch_maker = PatchMaker(patchsize, top_k=top_k, stride=patchstride)
         self.anomaly_segmentor = common.RescaleSegmentor(device=self.device, target_size=input_shape[-2:])
         self.model_dir = ""
         self.dataset_name = ""
         self.logger = None
 
-    def set_model_dir(self, model_dir, dataset_name):
+    def set_model_dir(self, model_dir, dataset_name, results_path="results"):
+        # results_path 是本次實驗的根目錄 (由 --results_path 指定)。
+        # eval / training / analyze results 全部掛在它底下，不同實驗才不會互相覆蓋。
+        self.results_path = results_path
         self.model_dir = model_dir
         os.makedirs(self.model_dir, exist_ok=True)
         self.ckpt_dir = os.path.join(self.model_dir, dataset_name)
@@ -210,7 +222,7 @@ class MICE(torch.nn.Module):
             except Exception as e:
                 LOGGER.warning(f"Failed to calculate FLOPs: {e}")
 
-        analyze_dir = os.path.join("results", "analyze results")
+        analyze_dir = os.path.join(self.results_path, "analyze results")
         os.makedirs(analyze_dir, exist_ok=True)
         
         csv_filename = f"training_log_{name}.csv"
@@ -218,7 +230,9 @@ class MICE(torch.nn.Module):
         
         with open(csv_filepath, mode='w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(["epoch", "epoch_time_s", "avg_perturbation_time_ms", "image_auroc", "pixel_auroc"])
+            writer.writerow(["epoch", "epoch_time_s", "avg_perturbation_time_ms", "image_auroc", "pixel_auroc",
+                             "acc", "balanced_acc", "f1", "recall_fake", "recall_real",
+                             "best_acc", "best_balanced_acc", "best_threshold"])
 
         LOGGER.info("Initializing Memory Bank for Manifold Interpolation...")
         bank_features = []
@@ -275,20 +289,26 @@ class MICE(torch.nn.Module):
 
             current_i_auroc = 0.0
             current_p_auroc = 0.0
+            current_cls = {}
 
             if (i_epoch + 1) % self.eval_epochs == 0:
-                images, scores, segmentations, labels_gt, masks_gt = self.predict(test_data)
-                image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro = self._evaluate(images, scores, segmentations,
-                                                                                        labels_gt, masks_gt, name)
-                
+                if self.thr_mode == "percentile":
+                    self.threshold = self.calibrate_threshold(train_data)
+                images, scores, segmentations, labels_gt, masks_gt, img_paths = self.predict(test_data)
+                image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro, cls = self._evaluate(
+                    images, scores, segmentations, labels_gt, masks_gt, name, img_paths=img_paths)
+
                 current_i_auroc = image_auroc
                 current_p_auroc = pixel_auroc
+                current_cls = cls
 
                 self.logger.logger.add_scalar("i-auroc", image_auroc, i_epoch)
                 self.logger.logger.add_scalar("p-auroc", pixel_auroc, i_epoch)
+                self.logger.logger.add_scalar("acc", cls["acc"], i_epoch)
+                self.logger.logger.add_scalar("balanced-acc", cls["balanced_acc"], i_epoch)
 
-                eval_path = './results/eval/' + name + '/'
-                train_path = './results/training/' + name + '/'
+                eval_path = os.path.join(self.results_path, 'eval', name) + '/'
+                train_path = os.path.join(self.results_path, 'training', name) + '/'
                 if best_record is None or image_auroc + pixel_auroc > best_record[0] + best_record[2]:
                     if best_record is not None:
                         os.remove(ckpt_path_best)
@@ -299,14 +319,19 @@ class MICE(torch.nn.Module):
                     shutil.copytree(train_path, eval_path)
 
                 pbar_str1 = f" IAUC:{round(image_auroc * 100, 2)}({round(best_record[0] * 100, 2)})" \
-                            f" PAUC:{round(pixel_auroc * 100, 2)}({round(best_record[2] * 100, 2)})" \
+                            f" ACC:{round(cls['acc'] * 100, 2)}" \
+                            f" BACC:{round(cls['balanced_acc'] * 100, 2)}" \
                             f" E:{i_epoch}({best_record[-1]})"
                 pbar_str += pbar_str1
                 pbar.set_description_str(pbar_str)
             
             with open(csv_filepath, mode='a', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow([i_epoch, f"{epoch_duration:.4f}", f"{avg_perturb_ms:.4f}", f"{current_i_auroc:.4f}", f"{current_p_auroc:.4f}"])
+                writer.writerow([i_epoch, f"{epoch_duration:.4f}", f"{avg_perturb_ms:.4f}",
+                                 f"{current_i_auroc:.4f}", f"{current_p_auroc:.4f}"] +
+                                [f"{current_cls.get(key, 0.):.4f}" for key in
+                                 ("acc", "balanced_acc", "f1", "recall_fake", "recall_real",
+                                  "best_acc", "best_balanced_acc", "best_threshold")])
 
         total_training_end = time.time()
         total_training_duration = total_training_end - total_training_start
@@ -498,7 +523,35 @@ class MICE(torch.nn.Module):
         avg_perturb_time_ms = np.mean(batch_perturb_times) if batch_perturb_times else 0.0
         return pbar_str2, all_p_true_, all_p_fake_, avg_perturb_time_ms
 
-    def tester(self, test_data, name):
+    def calibrate_threshold(self, train_data, limit=200):
+        """
+        用訓練集 (全部是正常樣本) 的分數分布決定判定門檻。
+
+        取第 thr_percentile 百分位 —— 意思是「容許 1% 的正常樣本被誤報」。
+        完全不碰 test 標籤，所以這是可部署的門檻，不像 best_threshold 那樣
+        是用測試答案挑出來的樂觀上界。
+
+        會這樣做是因為 discriminator 的輸出分數會整體漂移: DeepPCB 上
+        正常與異常的分數都擠在 0.9 以上，固定門檻 0.5 就切不到任何東西。
+        """
+        self.forward_modules.eval()
+        scores, seen = [], 0
+        with torch.no_grad():
+            for data in train_data:
+                img = data["image"] if isinstance(data, dict) else data
+                s, _ = self._predict(img)
+                scores.extend(np.asarray(s).ravel().tolist())
+                seen += img.shape[0]
+                if seen >= limit:
+                    break
+        if not scores:
+            return self.threshold
+        thr = float(np.percentile(scores, self.thr_percentile))
+        LOGGER.info(f"Calibrated threshold = {thr:.4f} "
+                    f"(p{self.thr_percentile} of {len(scores)} normal train scores)")
+        return thr
+
+    def tester(self, test_data, name, train_data=None):
         ckpt_path = glob.glob(self.ckpt_dir + '/ckpt_best*')
         if len(ckpt_path) != 0:
             state_dict = torch.load(ckpt_path[0], map_location=self.device)
@@ -509,41 +562,130 @@ class MICE(torch.nn.Module):
             else:
                 self.load_state_dict(state_dict, strict=False)
 
-            images, scores, segmentations, labels_gt, masks_gt = self.predict(test_data)
-            image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro = self._evaluate(images, scores, segmentations,
-                                                                                     labels_gt, masks_gt, name, path='eval')
+            if self.thr_mode == "percentile" and train_data is not None:
+                self.threshold = self.calibrate_threshold(train_data)
+
+            images, scores, segmentations, labels_gt, masks_gt, img_paths = self.predict(test_data)
+            image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro, cls = self._evaluate(
+                images, scores, segmentations, labels_gt, masks_gt, name, path='eval', img_paths=img_paths)
             epoch = int(ckpt_path[0].split('_')[-1].split('.')[0])
+
+            print("\n" + "=" * 46)
+            print(f" CLASSIFICATION REPORT: {name}   (n={cls['n']})")
+            print("=" * 46)
+            if self.single_class_test:
+                print(" test set 只有一種標籤 -> 無法計算 AUROC / accuracy。")
+                print(" 請看 analyze results/predictions_*.csv 的 score 排序與 heatmap。")
+                print("=" * 46 + "\n")
+                return image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro, epoch
+            print(f" threshold ({self.thr_mode:^10}) : {cls['threshold']:.4f}")
+            print(f" Accuracy               : {cls['acc'] * 100:.2f} %")
+            print(f" Balanced Accuracy      : {cls['balanced_acc'] * 100:.2f} %")
+            print(f" F1 (fake)              : {cls['f1'] * 100:.2f} %")
+            print(f" Recall  fake / real    : {cls['recall_fake'] * 100:.2f} % / {cls['recall_real'] * 100:.2f} %")
+            print(f" Confusion  TP/FP/FN/TN : {cls['tp']}/{cls['fp']}/{cls['fn']}/{cls['tn']}")
+            print(f" -- oracle threshold {cls['best_threshold']:.3f}: "
+                  f"acc {cls['best_acc'] * 100:.2f} % / bacc {cls['best_balanced_acc'] * 100:.2f} % (樂觀上界)")
+            print("=" * 46 + "\n")
         else:
             LOGGER.info("No ckpt file found!")
             return 0., 0., 0., 0., 0., -1.
 
         return image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro, epoch
 
-    def _evaluate(self, images, scores, segmentations, labels_gt, masks_gt, name, path='training'):
+    def _evaluate(self, images, scores, segmentations, labels_gt, masks_gt, name, path='training', img_paths=None):
         scores = np.squeeze(np.array(scores))
-        image_scores = metrics.compute_imagewise_retrieval_metrics(scores, labels_gt, path)
-        image_auroc = image_scores["auroc"]
-        image_ap = image_scores["ap"]
+
+        # test set 只有單一類別 (例如手上完全沒有假鞋樣本) 時無法定義 AUROC，
+        # 這時只輸出每張圖的 score 與 heatmap，不產生會誤導人的指標。
+        self.single_class_test = len(np.unique(np.asarray(labels_gt).astype(int))) < 2
+        if self.single_class_test:
+            image_auroc = image_ap = 0.
+        else:
+            image_scores = metrics.compute_imagewise_retrieval_metrics(scores, labels_gt, path)
+            image_auroc = image_scores["auroc"]
+            image_ap = image_scores["ap"]
+
+        # ── image-level 分類正確率 ────────────────────────────────
+        # discriminator 是 sigmoid 輸出且以 BCE (正常->0, 異常->1) 訓練，
+        # 門檻: thr_mode='fixed' 時就是 dsc_margin，'percentile' 時是訓練集校準出來的值。
+        cls = metrics.compute_classification_metrics(scores, labels_gt, threshold=self.threshold)
+        if self.single_class_test:
+            cls["best_threshold"] = cls["best_acc"] = cls["best_balanced_acc"] = 0.
+        else:
+            cls_best = metrics.search_best_threshold(scores, labels_gt, criterion="balanced_acc")
+            cls["best_threshold"] = cls_best["threshold"]
+            cls["best_acc"] = cls_best["acc"]
+            cls["best_balanced_acc"] = cls_best["balanced_acc"]
+
+        # 逐張影像的預測結果 (只在最終 eval 時輸出，訓練中每個 epoch 寫會太吵)
+        if path == 'eval' and img_paths is not None:
+            pred_dir = os.path.join(self.results_path, "analyze results")
+            os.makedirs(pred_dir, exist_ok=True)
+            pred_csv = os.path.join(pred_dir, f"predictions_{name}.csv")
+            with open(pred_csv, mode='w', newline='') as f:
+                w = csv.writer(f)
+                w.writerow(["image_path", "label", "label_name", "score", "pred", "correct"])
+                for p, lab, sc in zip(img_paths, labels_gt, np.asarray(scores).ravel()):
+                    pred = int(sc >= self.threshold)
+                    w.writerow([p, int(lab), "fake" if lab else "good", f"{float(sc):.6f}",
+                                pred, int(pred == int(lab))])
+            LOGGER.info(f"Per-image predictions written to {pred_csv}")
+
+            # 人看的報告 (含混淆矩陣與逐張對錯，判錯的排最前面)
+            report_txt = os.path.join(pred_dir, f"report_{name}.txt")
+            utils.write_eval_report(cls, name, img_paths, labels_gt,
+                                    np.asarray(scores).ravel(), self.threshold,
+                                    report_txt, single_class=self.single_class_test)
+            LOGGER.info(f"Evaluation report written to {report_txt}")
+
+            if not self.single_class_test:
+                cm_dir = os.path.join(self.results_path, path, name)
+                os.makedirs(cm_dir, exist_ok=True)
+                cm_png = os.path.join(cm_dir, "confusion_matrix.png")
+                utils.plot_confusion_matrix(cls, name, cm_png)
+                LOGGER.info(f"Confusion matrix written to {cm_png}")
 
         segmentations = np.array(segmentations)
-        pixel_scores = metrics.compute_pixelwise_retrieval_metrics(segmentations, masks_gt, path)
-        pixel_auroc = pixel_scores["auroc"]
-        pixel_ap = pixel_scores["ap"]
-        if path == 'eval':
-            try:
-                pixel_pro = metrics.compute_pro(np.squeeze(np.array(masks_gt)), segmentations)
-            except:
+
+        # 沒有 pixel-level ground truth 時 (image-level 二元分類模式)，跳過所有 pixel 指標。
+        # pixel_auroc 回傳 0. 會讓 trainer 的 best-ckpt 判準自動退化成只看 image AUROC。
+        masks_gt = np.array(masks_gt)
+        has_pixel_gt = masks_gt.size > 0 and masks_gt.max() > masks_gt.min()
+
+        if has_pixel_gt:
+            pixel_scores = metrics.compute_pixelwise_retrieval_metrics(segmentations, masks_gt, path)
+            pixel_auroc = pixel_scores["auroc"]
+            pixel_ap = pixel_scores["ap"]
+            if path == 'eval':
+                try:
+                    # PRO 要對 200 個門檻各做一次連通元件標記，成本隨影像數線性成長。
+                    # test set 很大時抽樣一部分影像來估計，否則單這一步就要跑上一小時。
+                    pro_masks, pro_segs = np.squeeze(masks_gt), segmentations
+                    pro_limit = 200
+                    if len(pro_masks) > pro_limit:
+                        sel = np.random.default_rng(0).choice(len(pro_masks), pro_limit, replace=False)
+                        pro_masks, pro_segs = pro_masks[sel], pro_segs[sel]
+                    pixel_pro = metrics.compute_pro(pro_masks, pro_segs)
+                except:
+                    pixel_pro = 0.
+            else:
                 pixel_pro = 0.
         else:
-            pixel_pro = 0.
+            pixel_auroc = pixel_ap = pixel_pro = 0.
 
-        defects = images 
+        defects = images
         targets = masks_gt
 
-        save_limit = min(len(defects), 50) 
+        save_limit = min(len(defects), 50)
 
-        ng_indices = [i for i, target in enumerate(targets) if target.sum() > 0]
-        ok_indices = [i for i, target in enumerate(targets) if target.sum() == 0]
+        # 有 mask 就照 mask 分 NG/OK，沒有就用 image-level 標籤
+        if has_pixel_gt:
+            ng_indices = [i for i, target in enumerate(targets) if target.sum() > 0]
+            ok_indices = [i for i, target in enumerate(targets) if target.sum() == 0]
+        else:
+            ng_indices = [i for i, lab in enumerate(labels_gt) if lab]
+            ok_indices = [i for i, lab in enumerate(labels_gt) if not lab]
 
         half_limit = save_limit // 2
 
@@ -556,30 +698,67 @@ class MICE(torch.nn.Module):
             ok_take = min(len(ok_indices), save_limit - ng_take)
 
         save_indices = ok_indices[:ok_take] + ng_indices[:ng_take]
-        
-        for idx, orig_idx in enumerate(save_indices):
+
+        seg_min, seg_max = float(segmentations.min()), float(segmentations.max())
+
+        def make_panel(orig_idx):
+            """組出 原圖 | (GT mask) | heatmap | overlay 的並排圖。"""
             defect = defects[orig_idx]
-            
-            target_mask = targets[orig_idx].astype(np.uint8)
-            if target_mask.shape[0] == 1:
-                target_mask = target_mask.transpose([1, 2, 0])
-                target_mask = np.repeat(target_mask, 3, axis=-1)
-            target = target_mask * 255
 
-            mask = cv2.cvtColor(cv2.resize(segmentations[orig_idx].astype(np.float32), (defect.shape[1], defect.shape[0])),
-                                cv2.COLOR_GRAY2BGR)
-            mask = (mask * 255).astype('uint8')
-            mask = cv2.applyColorMap(mask, cv2.COLORMAP_JET)
+            seg = cv2.resize(segmentations[orig_idx].astype(np.float32), (defect.shape[1], defect.shape[0]))
+            # 對整個 test set 用同一組 min/max 正規化，heatmap 之間才可互相比較
+            seg_norm = (seg - seg_min) / (seg_max - seg_min + 1e-8)
+            heat = cv2.applyColorMap((seg_norm * 255).astype('uint8'), cv2.COLORMAP_JET)
+            overlay = cv2.addWeighted(defect.astype('uint8'), 0.6, heat, 0.4, 0)
 
-            img_up = np.hstack([defect, target, mask])
-            img_up = cv2.resize(img_up, (256 * 3, 256))
-            full_path = './results/' + path + '/' + name + '/'
-            utils.del_remake_dir(full_path, del_flag=False)
+            if has_pixel_gt:
+                target_mask = targets[orig_idx].astype(np.uint8)
+                if target_mask.shape[0] == 1:
+                    target_mask = target_mask.transpose([1, 2, 0])
+                    target_mask = np.repeat(target_mask, 3, axis=-1)
+                panels = [defect, target_mask * 255, heat, overlay]
+            else:
+                panels = [defect, heat, overlay]
 
+            return cv2.resize(np.hstack(panels), (256 * len(panels), 256))
+
+        full_path = os.path.join(self.results_path, path, name) + '/'
+        utils.del_remake_dir(full_path, del_flag=False)
+
+        for idx, orig_idx in enumerate(save_indices):
             label_str = "NG" if orig_idx in ng_indices else "OK"
-            cv2.imwrite(full_path + str(idx + 1).zfill(3) + f'_{label_str}_img{orig_idx}.png', img_up)
+            cv2.imwrite(full_path + str(idx + 1).zfill(3) + f'_{label_str}_img{orig_idx}.png',
+                        make_panel(orig_idx))
 
-        return image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro
+        # ── 判斷錯誤的影像另存一份 ────────────────────────────────
+        # FN = 有瑕疵卻被判成正常 (漏檢，通常是最致命的那種錯)
+        # FP = 正常卻被判成有瑕疵 (誤報)
+        if path == 'eval' and not self.single_class_test and img_paths is not None:
+            preds = (np.asarray(scores).ravel() >= self.threshold).astype(int)
+            labels_arr = np.asarray(labels_gt).astype(int)
+            score_arr = np.asarray(scores).ravel()
+
+            # 漏檢按分數由低到高 (錯得最離譜的排前面)，誤報按分數由高到低
+            fn_idx = sorted(np.where((labels_arr == 1) & (preds == 0))[0], key=lambda i: score_arr[i])
+            fp_idx = sorted(np.where((labels_arr == 0) & (preds == 1))[0], key=lambda i: -score_arr[i])
+
+            wrong_dir = os.path.join(full_path, "wrong")
+            shutil.rmtree(wrong_dir, ignore_errors=True)
+            os.makedirs(wrong_dir, exist_ok=True)
+
+            wrong_limit = 100
+            for tag, idx_list in (("FN_defect_as_good", fn_idx), ("FP_good_as_defect", fp_idx)):
+                for rank, orig_idx in enumerate(idx_list[:wrong_limit], 1):
+                    stem = os.path.splitext(os.path.basename(str(img_paths[orig_idx])))[0]
+                    fname = f"{tag}_r{rank:03d}_s{score_arr[orig_idx]:.4f}_{stem}.png"
+                    cv2.imwrite(os.path.join(wrong_dir, fname), make_panel(orig_idx))
+
+            LOGGER.info(f"Wrong predictions: {len(fn_idx)} FN (瑕疵判成正常), "
+                        f"{len(fp_idx)} FP (正常判成瑕疵) -> {wrong_dir}"
+                        + (f"  [每類最多存 {wrong_limit} 張]"
+                           if max(len(fn_idx), len(fp_idx)) > wrong_limit else ""))
+
+        return image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro, cls
 
     def predict(self, test_dataloader):
         """This function provides anomaly scores/maps for full dataloaders."""
@@ -613,7 +792,7 @@ class MICE(torch.nn.Module):
         if len(masks_gt) > 0:
             masks_gt = np.concatenate(masks_gt, axis=0)
 
-        return images, scores, masks, labels_gt, masks_gt
+        return images, scores, masks, labels_gt, masks_gt, img_paths
 
     def _predict(self, img):
         """Infer score and mask for a batch of images."""

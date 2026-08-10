@@ -93,5 +93,13 @@ class PatchMaker:
     def score(self, x):
         x = x[:, :, 0]
 
-        x = torch.max(x, dim=1).values
+        # top_k <= 1 時退回原本的 max (工業瑕疵: 異常是單點局部的)。
+        # top_k > 1 時取最高的 k 個 patch 分數取平均，對「線索分散在整個物件上」
+        # 的任務 (例如真假鞋的比例/車線/logo 弧度) 較穩健，也比較不會被
+        # 單一反光或吊牌 patch 觸發。
+        if self.top_k > 1:
+            k = min(self.top_k, x.shape[1])
+            x = torch.topk(x, k=k, dim=1).values.mean(dim=1)
+        else:
+            x = torch.max(x, dim=1).values
         return x

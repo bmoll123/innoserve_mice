@@ -111,3 +111,93 @@ def torch_format_2_numpy_img(img):
         img = np.repeat(img, 3, axis=-1)
         img = (img * 255).astype('uint8')
     return img
+
+
+def plot_confusion_matrix(cls, name, out_path):
+    """畫 2x2 混淆矩陣 (good / fake)，存成 PNG。"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    # 列 = 真實標籤, 欄 = 預測
+    cm = np.array([[cls["tn"], cls["fp"]],
+                   [cls["fn"], cls["tp"]]], dtype=int)
+    labels = ["good", "fake"]
+
+    fig, ax = plt.subplots(figsize=(4.6, 4.2))
+    ax.imshow(cm, cmap="Blues", vmin=0, vmax=max(cm.max(), 1))
+
+    for i in range(2):
+        row_total = cm[i].sum()
+        for j in range(2):
+            pct = cm[i, j] / row_total * 100 if row_total else 0.
+            ax.text(j, i, f"{cm[i, j]}\n{pct:.1f}%", ha="center", va="center",
+                    fontsize=13,
+                    color="white" if cm[i, j] > cm.max() / 2 else "black")
+
+    ax.set_xticks([0, 1], labels)
+    ax.set_yticks([0, 1], labels)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Actual")
+    ax.set_title(f"{name}\nacc {cls['acc'] * 100:.2f}%  "
+                 f"balanced acc {cls['balanced_acc'] * 100:.2f}%  "
+                 f"(thr {cls['threshold']:.2f})", fontsize=10)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def write_eval_report(cls, name, img_paths, labels_gt, scores, threshold, out_path,
+                      single_class=False):
+    """把 test set 每張圖的預測結果寫成人看的 txt，判錯的排在最前面。"""
+    rows = []
+    for p, lab, sc in zip(img_paths, labels_gt, scores):
+        lab = int(lab)
+        pred = int(float(sc) >= threshold)
+        rows.append({
+            "file": os.path.basename(str(p)),
+            "actual": "fake" if lab else "good",
+            "pred": "fake" if pred else "good",
+            "score": float(sc),
+            "ok": pred == lab,
+        })
+
+    wrong = [r for r in rows if not r["ok"]]
+    width = max([len(r["file"]) for r in rows] + [20])
+
+    with open(out_path, "w") as f:
+        f.write(f"Evaluation report: {name}\n")
+        f.write("=" * 72 + "\n")
+        f.write(f"threshold            : {threshold:.4f}\n")
+        f.write(f"total test images    : {len(rows)}\n")
+        f.write(f"  actual good        : {sum(1 for r in rows if r['actual'] == 'good')}\n")
+        f.write(f"  actual fake        : {sum(1 for r in rows if r['actual'] == 'fake')}\n")
+        f.write(f"wrong predictions    : {len(wrong)}\n\n")
+
+        if single_class:
+            f.write("test set 只有一種標籤，accuracy / AUROC 無意義，以下僅供分數排序參考。\n\n")
+        else:
+            f.write("Confusion matrix (row = actual, col = predicted)\n")
+            f.write(f"{'':>10}{'good':>8}{'fake':>8}\n")
+            f.write(f"{'good':>10}{cls['tn']:>8}{cls['fp']:>8}\n")
+            f.write(f"{'fake':>10}{cls['fn']:>8}{cls['tp']:>8}\n\n")
+            f.write(f"accuracy             : {cls['acc'] * 100:.2f} %\n")
+            f.write(f"balanced accuracy    : {cls['balanced_acc'] * 100:.2f} %\n")
+            f.write(f"precision (fake)     : {cls['precision'] * 100:.2f} %\n")
+            f.write(f"recall  fake / good  : {cls['recall_fake'] * 100:.2f} % / "
+                    f"{cls['recall_real'] * 100:.2f} %\n")
+            f.write(f"f1 (fake)            : {cls['f1'] * 100:.2f} %\n\n")
+
+        def dump(title, items):
+            f.write("-" * 72 + "\n")
+            f.write(f"{title}  ({len(items)})\n")
+            f.write("-" * 72 + "\n")
+            f.write(f"{'file':<{width}} {'actual':>7} {'pred':>7} {'score':>9}  result\n")
+            for r in sorted(items, key=lambda x: -x["score"]):
+                f.write(f"{r['file']:<{width}} {r['actual']:>7} {r['pred']:>7} "
+                        f"{r['score']:>9.6f}  {'OK' if r['ok'] else 'WRONG'}\n")
+            f.write("\n")
+
+        if wrong:
+            dump("WRONG PREDICTIONS", wrong)
+        dump("ALL TEST IMAGES (score desc)", rows)
