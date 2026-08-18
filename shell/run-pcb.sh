@@ -1,12 +1,18 @@
 #!/bin/bash
 #
 # DeepPCB — 印刷電路板瑕疵 (open/short/mousebite/spur/copper/pin-hole)
-# 資料由 DeepPCB/to_mice.py 轉出
+# 資料由 DeepPCB/to_mice.py 轉出，每個 group (PCB 佈局) 各自一個 class，一次只練一個。
+# 換 group 只要改下面的 classes=('00041') 換成別的 id。
 #
-#   train/good  1000  (trainval 的 _temp，無瑕疵範本)
-#   test/good    500  (test 的 _temp)
-#   test/defect  500  (test 的 _test，每張 1~15 個瑕疵)
-#   ground_truth/defect  bbox pseudo mask
+# 可用的 group id (train/good 張數，全部 _temp 都進訓練，不切 held-out 的 test/good):
+#   00041(221) 12000(14) 12100(146) 12300(98) 13000(216) 20085(325)
+#   44000(100) 50600(79) 77000(107) 90100(74) 92000(120)
+#   12000 只有 14 張訓練圖，太少了，建議避開。
+#
+# 注意: 因為不切 test/good，test set 只有單一類別 (全是 defect)，
+# AUROC/accuracy/混淆矩陣都無法計算 (MICE 會自動偵測並改成只輸出
+# score 排序 + heatmap)。想要完整分類指標的話跟我說，我再幫 to_mice.py
+# 加回 test/good 的切分選項。
 #
 # 參數依實測的瑕疵尺寸挑選:
 #   瑕疵框長邊 median 38 px (p25 34 / p75 46)，相對於 640x640。
@@ -19,7 +25,7 @@
 # 重跑前記得: rm -rf results/pcb/models
 #
 datapath=/home/yuyun/Desktop/Innoserve/deeppcb_mice
-classes=('pcb')
+classes=('00041')
 
 flags=($(for class in "${classes[@]}"; do echo '-d '"${class}"; done))
 
@@ -28,7 +34,7 @@ python main.py \
     --gpu 0 \
     --seed 0 \
     --test ckpt \
-    --results_path results/pcb \
+    --results_path results/pcb_k=0.1 \
   net \
     -b wideresnet50 \
     -le layer2 \
@@ -41,7 +47,7 @@ python main.py \
     --dsc_layers 2 \
     --dsc_hidden 1024 \
     --pre_proj 1 \
-    --k 0.25 \
+    --k 0.1 \
     --n_neighbors 9 \
     --tangent_ratio 0.2 \
     --limit 1000 \

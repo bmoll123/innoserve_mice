@@ -124,6 +124,39 @@ def compute_pixelwise_retrieval_metrics(anomaly_segmentations, ground_truth_mask
     return {"auroc": auroc, "ap": ap}
 
 
+def search_best_pixel_threshold(segmentations, masks, criterion="f1", max_pixels=2_000_000, seed=0):
+    """
+    像 search_best_threshold，但在「攤平後的像素」上搜尋，不是影像分數。
+
+    不能直接拿 image-level 的 best_threshold/oracle_f1 門檻套用在像素上:
+    影像分數是該圖所有 patch 取 max，天生就比大多數像素分數高出一截，
+    用影像門檻卡像素等於要求「每個像素都跟全圖最高分一樣高」，
+    結果幾乎必定整片背景 (實測驗證過: 一張真的有瑕疵的圖，套用
+    image-level oracle_f1=1.0 當像素門檻，predict mask 全黑)。
+
+    像素數量通常有幾百萬到幾億，逐一過 500 個候選門檻太慢，
+    所以先做隨機抽樣 (對門檻搜尋的影響可忽略，抽樣後再交給
+    search_best_threshold 本身的候選門檻抽樣機制)。
+    """
+    if isinstance(segmentations, list):
+        segmentations = np.stack(segmentations)
+    if isinstance(masks, list):
+        masks = np.stack(masks)
+
+    scores = segmentations.ravel().astype(np.float32)
+    labels = masks.ravel().astype(int)
+
+    if len(np.unique(labels)) < 2:
+        return {"threshold": 0.5, "f1": 0., "balanced_acc": 0., "acc": 0.}
+
+    if scores.size > max_pixels:
+        rng = np.random.default_rng(seed)
+        idx = rng.integers(0, scores.size, max_pixels)
+        scores, labels = scores[idx], labels[idx]
+
+    return search_best_threshold(scores, labels, criterion=criterion)
+
+
 def compute_pro(masks, amaps, num_th=200):
     # 每個門檻的結果先收在 list，最後一次組成 DataFrame。
     # 原本用 df.append 逐列累加，那個 API 已被 pandas 棄用，每次呼叫都會噴

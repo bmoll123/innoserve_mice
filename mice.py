@@ -1,9 +1,12 @@
 from collections import OrderedDict
 from torch.utils.tensorboard import SummaryWriter
+from torchvision import transforms
 from model import Discriminator, Projection, PatchMaker
+from pathlib import Path
 
 import numpy as np
 import torch.nn.functional as F
+import PIL.Image
 
 import logging
 import os
@@ -232,7 +235,8 @@ class MICE(torch.nn.Module):
             writer = csv.writer(f)
             writer.writerow(["epoch", "epoch_time_s", "avg_perturbation_time_ms", "image_auroc", "pixel_auroc",
                              "acc", "balanced_acc", "f1", "recall_fake", "recall_real",
-                             "best_acc", "best_balanced_acc", "best_threshold"])
+                             "best_acc", "best_balanced_acc", "best_threshold",
+                             "best_f1", "best_f1_threshold"])
 
         LOGGER.info("Initializing Memory Bank for Manifold Interpolation...")
         bank_features = []
@@ -331,7 +335,8 @@ class MICE(torch.nn.Module):
                                  f"{current_i_auroc:.4f}", f"{current_p_auroc:.4f}"] +
                                 [f"{current_cls.get(key, 0.):.4f}" for key in
                                  ("acc", "balanced_acc", "f1", "recall_fake", "recall_real",
-                                  "best_acc", "best_balanced_acc", "best_threshold")])
+                                  "best_acc", "best_balanced_acc", "best_threshold",
+                                  "best_f1", "best_f1_threshold")])
 
         total_training_end = time.time()
         total_training_duration = total_training_end - total_training_start
@@ -577,7 +582,7 @@ class MICE(torch.nn.Module):
                 print(" test set 只有一種標籤 -> 無法計算 AUROC / accuracy。")
                 print(" 請看 analyze results/predictions_*.csv 的 score 排序與 heatmap。")
                 print("=" * 46 + "\n")
-                return image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro, epoch
+                return image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro, epoch, 0., 0.
             print(f" threshold ({self.thr_mode:^10}) : {cls['threshold']:.4f}")
             print(f" Accuracy               : {cls['acc'] * 100:.2f} %")
             print(f" Balanced Accuracy      : {cls['balanced_acc'] * 100:.2f} %")
@@ -586,12 +591,118 @@ class MICE(torch.nn.Module):
             print(f" Confusion  TP/FP/FN/TN : {cls['tp']}/{cls['fp']}/{cls['fn']}/{cls['tn']}")
             print(f" -- oracle threshold {cls['best_threshold']:.3f}: "
                   f"acc {cls['best_acc'] * 100:.2f} % / bacc {cls['best_balanced_acc'] * 100:.2f} % (樂觀上界)")
+            print(f" -- oracle threshold {cls['best_f1_threshold']:.3f}: "
+                  f"best F1 {cls['best_f1'] * 100:.2f} % (樂觀上界)")
             print("=" * 46 + "\n")
         else:
             LOGGER.info("No ckpt file found!")
-            return 0., 0., 0., 0., 0., -1.
+            return 0., 0., 0., 0., 0., -1., 0., 0.
 
-        return image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro, epoch
+        return image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro, epoch, cls["best_f1"], cls["best_f1_threshold"]
+
+    def visualize_all(self, group_dir, out_dir, resize, imagesize):
+        """
+        對 test/good、test/defect、other_fake 底下「每一張」圖存四聯圖:
+        原圖 | GT mask | predict mask (二值化) | predict mask 疊加在原圖上。
+
+        跟 _evaluate() 裡的可視化不一樣的地方:
+          1. 不抽樣，全部圖都存 (_evaluate 最多存 50 張 + wrong/ 100 張)
+          2. 涵蓋 other_fake —— 這個資料夾故意放在 test/ 外面讓 MVTecDataset
+             掃不到、不進入 AUROC/accuracy 計算 (詳見 to_mice.py)，但這裡要看圖就直接讀。
+          3. predict mask 是二值化的，門檻是「這個 group 自己的 pixel-level 門檻」，
+             不是 self.threshold (那是 image-level 的門檻，套用在像素上幾乎必定全黑：
+             image score = 該圖所有 patch 取 max，天生比大多數像素分數高一截，
+             用它卡每個像素等於要求每個像素都跟全圖最高分一樣高)。
+
+        分兩階段跑，GPU 推論只做一次:
+          第一階段: 每張圖跑一次 _predict()，把 segmentation map 和 GT mask 都留著
+          第二階段: 用全部圖的像素分佈搜出這個 group 的 pixel 門檻，才二值化、存圖
+        """
+        group_dir = Path(group_dir)
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        img_tf = transforms.Compose([
+            transforms.Resize(resize),
+            transforms.CenterCrop(imagesize),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ])
+        mask_tf = transforms.Compose([
+            transforms.Resize(resize),
+            transforms.CenterCrop(imagesize),
+            transforms.ToTensor(),
+        ])
+
+        # (子資料夾, 對應的 GT mask 資料夾或 None=一律視為無瑕疵)
+        sources = [
+            ("test/good", None),
+            ("test/defect", "ground_truth/defect"),
+            ("other_fake", "other_fake_masks"),
+        ]
+
+        self.forward_modules.eval()
+        if self.pre_proj > 0:
+            self.pre_projection.eval()
+        self.discriminator.eval()
+
+        # ── 第一階段: 跑推論，把結果都留著 ──────────────────────
+        items = []  # (sub, stem, orig_bgr, seg_map, gt_arr)
+        for sub, mask_sub in sources:
+            img_dir = group_dir / sub
+            if not img_dir.is_dir():
+                continue
+            paths = sorted(p for p in img_dir.iterdir() if p.suffix.lower() in (".jpg", ".jpeg", ".png"))
+
+            for p in tqdm.tqdm(paths, desc=f"infer {sub}", leave=False):
+                pil_img = PIL.Image.open(p).convert("RGB")
+                img_t = img_tf(pil_img).unsqueeze(0)
+
+                with torch.no_grad():
+                    _, seg = self._predict(img_t)
+                seg = seg[0]  # (H, W)，已經是 self.input_shape 的解析度
+
+                if mask_sub is not None and (group_dir / mask_sub / f"{p.stem}.png").exists():
+                    gt = PIL.Image.open(group_dir / mask_sub / f"{p.stem}.png").convert("L")
+                    gt_arr = (mask_tf(gt).numpy()[0] * 255).astype(np.uint8)
+                else:
+                    gt_arr = np.zeros(seg.shape, dtype=np.uint8)
+
+                orig = utils.torch_format_2_numpy_img(img_t[0].cpu().numpy())
+                items.append((sub, p.stem, orig, seg, gt_arr))
+
+        if not items:
+            LOGGER.info(f"visualize_all: {group_dir} 底下找不到圖")
+            return 0
+
+        # ── 搜尋這個 group 專屬的 pixel 門檻 ──────────────────────
+        all_segs = np.stack([it[3] for it in items])
+        all_gts = (np.stack([it[4] for it in items]) > 0).astype(np.uint8)
+        pix_thr = metrics.search_best_pixel_threshold(all_segs, all_gts, criterion="f1")["threshold"]
+        LOGGER.info(f"visualize_all: pixel threshold = {pix_thr:.4f} "
+                    f"(self.threshold={self.threshold:.4f} 是 image-level 的，這裡不能共用)")
+
+        # ── 第二階段: 二值化、存四聯圖 ──────────────────────
+        for sub, stem, orig, seg, gt_arr in items:
+            pred_arr = ((seg - pix_thr) > 0).astype(np.uint8) * 255
+
+            gt_rgb = cv2.cvtColor(gt_arr, cv2.COLOR_GRAY2BGR)
+            pred_rgb = cv2.cvtColor(pred_arr, cv2.COLOR_GRAY2BGR)
+
+            overlay = orig.copy()
+            red = np.zeros_like(orig)
+            red[..., 2] = 255  # BGR，紅色標前景
+            mask_bool = pred_arr > 0
+            overlay[mask_bool] = cv2.addWeighted(orig, 0.4, red, 0.6, 0)[mask_bool]
+
+            panel = np.hstack([orig, gt_rgb, pred_rgb, overlay])
+            panel = cv2.resize(panel, (256 * 4, 256))
+
+            sub_flat = sub.replace("/", "_")
+            cv2.imwrite(str(out_dir / f"{sub_flat}__{stem}.png"), panel)
+
+        LOGGER.info(f"visualize_all: {len(items)} 張圖存到 {out_dir} (pixel threshold={pix_thr:.4f})")
+        return len(items)
 
     def _evaluate(self, images, scores, segmentations, labels_gt, masks_gt, name, path='training', img_paths=None):
         scores = np.squeeze(np.array(scores))
@@ -608,15 +719,27 @@ class MICE(torch.nn.Module):
 
         # ── image-level 分類正確率 ────────────────────────────────
         # discriminator 是 sigmoid 輸出且以 BCE (正常->0, 異常->1) 訓練，
-        # 門檻: thr_mode='fixed' 時就是 dsc_margin，'percentile' 時是訓練集校準出來的值。
+        # 門檻: thr_mode='fixed' 時就是 dsc_margin，'percentile' 時是訓練集校準出來的值，
+        # 'oracle_f1' 時直接拿這次 test 的分數搜尋讓 F1 最大的門檻。
+        # 注意: oracle_f1 用了 test 標籤去挑門檻，是樂觀上界，不是可部署的校準方式，
+        # 只適合「就是要在這批固定的 test 圖上報最好的 F1」這種用途 (常見於論文報表)。
+        if self.thr_mode == "oracle_f1" and not self.single_class_test:
+            self.threshold = metrics.search_best_threshold(scores, labels_gt, criterion="f1")["threshold"]
+
         cls = metrics.compute_classification_metrics(scores, labels_gt, threshold=self.threshold)
         if self.single_class_test:
             cls["best_threshold"] = cls["best_acc"] = cls["best_balanced_acc"] = 0.
+            cls["best_f1"] = cls["best_f1_threshold"] = 0.
         else:
+            # 兩組獨立搜尋: bacc 最佳門檻和 f1 最佳門檻通常不是同一個。
             cls_best = metrics.search_best_threshold(scores, labels_gt, criterion="balanced_acc")
             cls["best_threshold"] = cls_best["threshold"]
             cls["best_acc"] = cls_best["acc"]
             cls["best_balanced_acc"] = cls_best["balanced_acc"]
+
+            cls_best_f1 = metrics.search_best_threshold(scores, labels_gt, criterion="f1")
+            cls["best_f1"] = cls_best_f1["f1"]
+            cls["best_f1_threshold"] = cls_best_f1["threshold"]
 
         # 逐張影像的預測結果 (只在最終 eval 時輸出，訓練中每個 epoch 寫會太吵)
         if path == 'eval' and img_paths is not None:

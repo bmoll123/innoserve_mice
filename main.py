@@ -19,6 +19,10 @@ import utils
 @click.option("--log_project", type=str, default="project")
 @click.option("--run_name", type=str, default="test")
 @click.option("--test", type=str, default="ckpt")
+@click.option("--visualize_all", is_flag=True,
+              help="對 test/good、test/defect、other_fake 每一張圖 (不抽樣) 存 "
+                   "原圖|GT mask|predict mask|overlay 四聯圖，predict mask 用 "
+                   "self.threshold 二值化")
 def main(**kwargs):
     pass
 
@@ -53,9 +57,10 @@ def main(**kwargs):
 @click.option("--limit", type=int, default=392)
 @click.option(
     "--thr_mode",
-    type=click.Choice(["fixed", "percentile"]),
+    type=click.Choice(["fixed", "percentile", "oracle_f1"]),
     default="fixed",
-    help="fixed = 用 dsc_margin 當判定門檻; percentile = 用訓練集(全正常)分數的百分位自動校準",
+    help="fixed = 用 dsc_margin 當判定門檻; percentile = 用訓練集(全正常)分數的百分位自動校準; "
+         "oracle_f1 = 用這次 test 的分數搜尋讓 F1 最大的門檻 (樂觀上界，不可部署，只適合報表)",
 )
 @click.option(
     "--thr_percentile",
@@ -238,6 +243,7 @@ def run(
     log_project,
     run_name,
     test,
+    visualize_all,
 ):
     methods = {key: item for (key, item) in methods}
 
@@ -284,11 +290,22 @@ def run(
                 )
 
             if type(flag) != int:
-                i_auroc, i_ap, p_auroc, p_ap, p_pro, epoch = MICE.tester(
+                i_auroc, i_ap, p_auroc, p_ap, p_pro, epoch, best_f1, best_f1_thr = MICE.tester(
                     dataloaders["testing"],
                     dataloaders["training"].name,
                     train_data=dataloaders["training"],
                 )
+
+                if visualize_all and epoch > -1:
+                    test_ds = dataloaders["testing"].dataset
+                    viz_out = os.path.join(run_save_path, "eval", dataset_name, "visualize_all")
+                    MICE.visualize_all(
+                        os.path.join(test_ds.source, test_ds.classname),
+                        viz_out,
+                        test_ds.resize,
+                        test_ds.imgsize,
+                    )
+
                 result_collect.append(
                     {
                         "dataset_name": dataset_name,
@@ -298,6 +315,8 @@ def run(
                         "pixel_ap": p_ap,
                         "pixel_pro": p_pro,
                         "best_epoch": epoch,
+                        "best_f1": best_f1,
+                        "best_f1_threshold": best_f1_thr,
                     }
                 )
 
