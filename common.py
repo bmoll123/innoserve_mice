@@ -46,10 +46,10 @@ class Aggregator(torch.nn.Module):
 
 
 class RescaleSegmentor:
-    def __init__(self, device, target_size=288):
+    def __init__(self, device, target_size=288, smoothing=4):
         self.device = device
         self.target_size = target_size
-        self.smoothing = 4
+        self.smoothing = smoothing
 
     def convert_to_segmentation(self, patch_scores):
         with torch.no_grad():

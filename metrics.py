@@ -157,6 +157,69 @@ def search_best_pixel_threshold(segmentations, masks, criterion="f1", max_pixels
     return search_best_threshold(scores, labels, criterion=criterion)
 
 
+def _box_iou(box1, box2):
+    """box = (x, y, w, h)。"""
+    x1, y1, w1, h1 = box1
+    x2, y2, w2, h2 = box2
+    ix1, iy1 = max(x1, x2), max(y1, y2)
+    ix2, iy2 = min(x1 + w1, x2 + w2), min(y1 + h1, y2 + h2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    union = w1 * h1 + w2 * h2 - inter
+    return inter / union if union > 0 else 0.
+
+
+def compute_detection_ap(predictions, gts_per_image, iou_thresh=0.5):
+    """
+    標準物件偵測 AP (VOC2012 風格，all-point interpolation)，整個 group 一個
+    數字，不是單張圖的分數。
+
+    predictions: [(img_idx, box(x,y,w,h), confidence), ...]，全部圖的 predict
+                 box 混在一起，不分圖。
+    gts_per_image: {img_idx: [box(x,y,w,h), ...]}，每張圖各自的 GT box。
+
+    做法: 依 confidence 由高到低排序，逐一跟同一張圖裡「還沒被配過」的 GT box
+    配對 (取 IoU 最高的那個)，IoU >= iou_thresh 才算 TP，一個 GT 只能配一次
+    (配過的下一個 predict box 再撞到只能算 FP，不能重複計分，這是標準做法，
+    避免同一個瑕疵被框好幾次就灌水)。算出 precision-recall 曲線後取面積。
+    """
+    total_gt = sum(len(v) for v in gts_per_image.values())
+    if total_gt == 0 or not predictions:
+        return 0.
+
+    preds = sorted(predictions, key=lambda p: -p[2])
+    matched = {k: [False] * len(v) for k, v in gts_per_image.items()}
+    tp = np.zeros(len(preds))
+    fp = np.zeros(len(preds))
+
+    for i, (img_idx, box, _conf) in enumerate(preds):
+        gts = gts_per_image.get(img_idx, [])
+        best_iou, best_j = 0., -1
+        for j, gt_box in enumerate(gts):
+            if matched[img_idx][j]:
+                continue
+            iou = _box_iou(box, gt_box)
+            if iou > best_iou:
+                best_iou, best_j = iou, j
+        if best_iou >= iou_thresh:
+            tp[i] = 1
+            matched[img_idx][best_j] = True
+        else:
+            fp[i] = 1
+
+    cum_tp = np.cumsum(tp)
+    cum_fp = np.cumsum(fp)
+    recall = cum_tp / total_gt
+    precision = cum_tp / np.maximum(cum_tp + cum_fp, 1e-8)
+
+    mrec = np.concatenate([[0.], recall, [1.]])
+    mpre = np.concatenate([[0.], precision, [0.]])
+    for i in range(len(mpre) - 2, -1, -1):
+        mpre[i] = max(mpre[i], mpre[i + 1])
+    idx = np.where(mrec[1:] != mrec[:-1])[0]
+    return float(np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1]))
+
+
 def compute_pro(masks, amaps, num_th=200):
     # 每個門檻的結果先收在 list，最後一次組成 DataFrame。
     # 原本用 df.append 逐列累加，那個 API 已被 pandas 棄用，每次呼叫都會噴

@@ -30,11 +30,10 @@ python main.py \
     --gpu 0 \
     --seed 0 \
     --test ckpt \
-    --results_path results/0829/pcb_groups_k=0.25 \
+    --results_path results/0828/pcb_groups_k=0.25 \
     --visualize_all \
   net \
     -b wideresnet50 \
-    -le layer1 \
     -le layer2 \
     -le layer3 \
     --pretrain_embed_dimension 1536 \
@@ -53,12 +52,12 @@ python main.py \
     --thr_mode oracle_acc \
     --accum_images 8 \
   dataset \
-    --batch_size 2 \
+    --batch_size 1 \
     --resize 640 \
     --imagesize 640 "${flags[@]}" mvtec $datapath 
   
 
-python summarize_results.py --results_path "results/0829/pcb_groups_k=0.25"
+python summarize_results.py --results_path "results/0828/pcb_groups_k=0.25"
 
 # python main.py \
 #     --gpu 0 \

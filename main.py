@@ -20,9 +20,15 @@ import utils
 @click.option("--run_name", type=str, default="test")
 @click.option("--test", type=str, default="ckpt")
 @click.option("--visualize_all", is_flag=True,
-              help="對 test/good、test/defect、other_fake 每一張圖 (不抽樣) 存 "
-                   "原圖|GT mask|predict mask|overlay 四聯圖，predict mask 用 "
-                   "self.threshold 二值化")
+              help="final_test() 一定會產生 report.txt/predictions.csv/confusion_matrix.png/"
+                   "wrong/；加這個 flag 才會額外把 test/good+test/defect+other_fake 每一張圖 "
+                   "(不抽樣) 存成六聯圖到 visualize_all/ (張數多，較慢)")
+@click.option("--min_box_area", type=int, default=200,
+              help="final_test() 把 predict_mask 轉成 bbox 時，連通元件面積(px^2)小於這個值"
+                   "直接丟棄、不生成框，用來過濾零星小雜訊框。資料集是 640x640，預設 200 "
+                   "(單張圖 test_single_image.py 實測 12100/other_fake/163 選出來的值，"
+                   "再往上到 400 沒有再濾掉東西)；如果還是有很多小框沒被濾掉就調大，"
+                   "太多真的瑕疵被濾掉就調小。")
 def main(**kwargs):
     pass
 
@@ -57,10 +63,14 @@ def main(**kwargs):
 @click.option("--limit", type=int, default=392)
 @click.option(
     "--thr_mode",
-    type=click.Choice(["fixed", "percentile", "oracle_f1"]),
+    type=click.Choice(["fixed", "percentile", "oracle_f1", "oracle_acc"]),
     default="fixed",
     help="fixed = 用 dsc_margin 當判定門檻; percentile = 用訓練集(全正常)分數的百分位自動校準; "
-         "oracle_f1 = 用這次 test 的分數搜尋讓 F1 最大的門檻 (樂觀上界，不可部署，只適合報表)",
+         "oracle_f1 = 用這次 test 的分數搜尋讓 F1 最大的門檻; "
+         "oracle_acc = 用這次 test 的分數搜尋讓 accuracy 最大的門檻 "
+         "(oracle_f1/oracle_acc 都是樂觀上界，不可部署，只適合報表；"
+         "門檻是在驗證集(1:1 平衡的 test/good vs test/defect)上搜尋出來的，"
+         "final_test 展開成全部 test 後沿用同一個值，不會重新搜)",
 )
 @click.option(
     "--thr_percentile",
@@ -73,6 +83,25 @@ def main(**kwargs):
     type=int,
     default=1,
     help="Image score = mean of top-k patch scores. 1 = original max-pooling.",
+)
+@click.option(
+    "--blur_sigma",
+    type=float,
+    default=4.0,
+    help="Pixel-level segmentation map 的 Gaussian blur 標準差 (純推論後處理，"
+         "不影響訓練/權重，改了不用重新 train)。預設 4 是原版設定，數值越小，"
+         "heatmap 峰值越銳利、越不會被抹開/位移，但雜訊也會變多；bbox 定位不準"
+         "多半是這個造成的，可以先試著調低看看。",
+)
+@click.option(
+    "--accum_images",
+    type=int,
+    default=1,
+    help="累積這麼多張圖的梯度才更新一次權重 (gradient accumulation)，等效於把 "
+         "batch size 放大成這個值，但不用真的一次塞更多圖進 GPU (訓練時間會變長，"
+         "因為 forward/backward 次數不變，只是延後 optimizer.step())。"
+         "1 = 跟原本一樣每個 batch 都更新。例如 --batch_size 8 --accum_images 16 "
+         "就是每 2 個 batch 才更新一次，等效 batch size 16。",
 )
 def net(
     backbone_names,
@@ -95,6 +124,8 @@ def net(
     top_k,
     thr_mode,
     thr_percentile,
+    blur_sigma,
+    accum_images,
 ):
     backbone_names = list(backbone_names)
     if len(backbone_names) > 1:
@@ -141,6 +172,8 @@ def net(
                 top_k=top_k,
                 thr_mode=thr_mode,
                 thr_percentile=thr_percentile,
+                blur_sigma=blur_sigma,
+                accum_images=accum_images,
             )
             micees.append(mice_inst.to(device))
         return micees
@@ -244,6 +277,7 @@ def run(
     run_name,
     test,
     visualize_all,
+    min_box_area,
 ):
     methods = {key: item for (key, item) in methods}
 
@@ -296,14 +330,15 @@ def run(
                     train_data=dataloaders["training"],
                 )
 
-                if visualize_all and epoch > -1:
+                if epoch > -1:
                     test_ds = dataloaders["testing"].dataset
-                    viz_out = os.path.join(run_save_path, "eval", dataset_name, "visualize_all")
-                    MICE.visualize_all(
+                    MICE.final_test(
                         os.path.join(test_ds.source, test_ds.classname),
-                        viz_out,
+                        test_ds.classname,
                         test_ds.resize,
                         test_ds.imgsize,
+                        save_visualizations=visualize_all,
+                        min_box_area=min_box_area,
                     )
 
                 result_collect.append(

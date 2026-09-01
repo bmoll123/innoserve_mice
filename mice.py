@@ -69,6 +69,8 @@ class MICE(torch.nn.Module):
             top_k=1,
             thr_mode="fixed",
             thr_percentile=99.0,
+            blur_sigma=4,
+            accum_images=1,
             **kwargs,
     ):
         self.backbone = backbone.to(device)
@@ -122,9 +124,14 @@ class MICE(torch.nn.Module):
         self.memory_bank = None
         self.k = k
         self.limit = limit
+        # 累積這麼多張圖的梯度才更新一次權重 (gradient accumulation)，
+        # 等效於把 batch size 放大到 accum_images，但不用真的一次塞更多圖進 GPU。
+        # 1 = 跟原本一樣，每個 batch 都更新。
+        self.accum_images = max(1, accum_images)
 
         self.patch_maker = PatchMaker(patchsize, top_k=top_k, stride=patchstride)
-        self.anomaly_segmentor = common.RescaleSegmentor(device=self.device, target_size=input_shape[-2:])
+        self.anomaly_segmentor = common.RescaleSegmentor(device=self.device, target_size=input_shape[-2:],
+                                                          smoothing=blur_sigma)
         self.model_dir = ""
         self.dataset_name = ""
         self.logger = None
@@ -381,16 +388,25 @@ class MICE(torch.nn.Module):
         batch_perturb_times = [] 
         
         sample_num = 0
-        
-        bank_subset_size = 4096 
-        
-        for i_iter, data_item in enumerate(train_data):
-            self.dsc_opt.zero_grad()
-            if self.pre_proj > 0:
-                self.proj_opt.zero_grad()
 
+        bank_subset_size = 4096
+
+        # ── Gradient accumulation ────────────────────────────────
+        # accum_steps 用第一個 batch 的實際大小換算，累積這麼多個 batch 的梯度
+        # 才呼叫一次 optimizer.step()，等效於把 batch size 放大成 accum_images，
+        # 不用真的一次塞更多張圖進 GPU。每個 batch 的 loss 除以 accum_steps 再
+        # backward()，梯度才會是「平均」而不是「加總放大 accum_steps 倍」。
+        accum_steps = 1
+        accum_count = 0
+        self.dsc_opt.zero_grad()
+        if self.pre_proj > 0:
+            self.proj_opt.zero_grad()
+
+        for i_iter, data_item in enumerate(train_data):
             img = data_item["image"]
             img = img.to(torch.float).to(self.device)
+            if i_iter == 0:
+                accum_steps = max(1, round(self.accum_images / img.shape[0]))
             if self.pre_proj > 0:
                 true_feats = self.pre_projection(self._embed(img, evaluation=False)[0])
             else:
@@ -476,12 +492,23 @@ class MICE(torch.nn.Module):
             bce_loss = true_loss + fake_loss
 
             loss = svdd_loss + bce_loss
-            loss.backward()
-            if self.pre_proj > 0:
-                self.proj_opt.step()
-            if self.train_backbone:
-                self.backbone_opt.step()
-            self.dsc_opt.step()
+            (loss / accum_steps).backward()
+            accum_count += 1
+
+            # 累積夠 accum_steps 個 batch (等效 accum_images 張圖) 才真正更新權重，
+            # 或這是這個 epoch 最後一個 batch 時強制更新一次 (不然剩下的梯度會被丟掉)。
+            is_last_batch = (i_iter == len(train_data) - 1)
+            if accum_count >= accum_steps or is_last_batch:
+                if self.pre_proj > 0:
+                    self.proj_opt.step()
+                if self.train_backbone:
+                    self.backbone_opt.step()
+                self.dsc_opt.step()
+
+                self.dsc_opt.zero_grad()
+                if self.pre_proj > 0:
+                    self.proj_opt.zero_grad()
+                accum_count = 0
 
             pix_true = true_scores.detach()
             pix_fake = fake_scores.detach()
@@ -524,6 +551,18 @@ class MICE(torch.nn.Module):
             pbar.set_description_str(pbar_str)
 
             if sample_num > self.limit:
+                if accum_count > 0:
+                    # --limit 提早結束這個 epoch，把還沒套用的累積梯度補做最後一次更新，
+                    # 不然這幾個 batch 的梯度會被靜靜丟掉。
+                    if self.pre_proj > 0:
+                        self.proj_opt.step()
+                    if self.train_backbone:
+                        self.backbone_opt.step()
+                    self.dsc_opt.step()
+                    self.dsc_opt.zero_grad()
+                    if self.pre_proj > 0:
+                        self.proj_opt.zero_grad()
+                    accum_count = 0
                 break
         avg_perturb_time_ms = np.mean(batch_perturb_times) if batch_perturb_times else 0.0
         return pbar_str2, all_p_true_, all_p_fake_, avg_perturb_time_ms
@@ -600,27 +639,54 @@ class MICE(torch.nn.Module):
 
         return image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro, epoch, cls["best_f1"], cls["best_f1_threshold"]
 
-    def visualize_all(self, group_dir, out_dir, resize, imagesize):
+    def final_test(self, group_dir, group_id, resize, imagesize, save_visualizations=True,
+                   min_box_area=200):
         """
-        對 test/good、test/defect、other_fake 底下「每一張」圖存四聯圖:
-        原圖 | GT mask | predict mask (二值化) | predict mask 疊加在原圖上。
+        最終測試:對 test/good + test/defect + other_fake「全部」圖跑一次推論，
+        產生這個 group 的正式報告(取代舊的 visualize_all)。
 
-        跟 _evaluate() 裡的可視化不一樣的地方:
-          1. 不抽樣，全部圖都存 (_evaluate 最多存 50 張 + wrong/ 100 張)
-          2. 涵蓋 other_fake —— 這個資料夾故意放在 test/ 外面讓 MVTecDataset
-             掃不到、不進入 AUROC/accuracy 計算 (詳見 to_mice.py)，但這裡要看圖就直接讀。
-          3. predict mask 是二值化的，門檻是「這個 group 自己的 pixel-level 門檻」，
-             不是 self.threshold (那是 image-level 的門檻，套用在像素上幾乎必定全黑：
-             image score = 該圖所有 patch 取 max，天生比大多數像素分數高一截，
-             用它卡每個像素等於要求每個像素都跟全圖最高分一樣高)。
+        跟 tester() 內部那次驗證(_evaluate, path='eval')不一樣:
+          - 驗證集是 1:1 平衡的 test/good vs test/defect，訓練過程中每個 epoch
+            拿來校準門檻/挑 best ckpt。
+          - 這裡是「展開」成 test/good vs (test/defect + other_fake) 的完整測試，
+            訓練完只跑一次。
+          - 門檻: thr_mode='fixed'/'percentile' 時沿用 self.threshold (跟驗證集
+            用同一顆，才是誠實的可部署數字，沒有用這批 test 的答案去挑)；
+            thr_mode='oracle_f1'/'oracle_acc' 時**直接在這批展開後的 test 分數上
+            重新搜尋**(不是沿用驗證集搜出來的值)，因為 oracle 本來就是要回答
+            「這批 test 資料最好能到多少」，用驗證集那批小樣本搜出來的門檻套到
+            這裡不見得是這批 test 上真正最佳的切點，兩邊都是樂觀上界，但拿哪批
+            資料的答案去挑，上界會不一樣。
 
-        分兩階段跑，GPU 推論只做一次:
-          第一階段: 每張圖跑一次 _predict()，把 segmentation map 和 GT mask 都留著
-          第二階段: 用全部圖的像素分佈搜出這個 group 的 pixel 門檻，才二值化、存圖
+        輸出全部收在 results_path/analyze results/<group_id>/ (不加 val_ 前綴，
+        跟 tester() 驗證集那份 val_report.txt/val_predictions.csv 分開放):
+          report.txt / predictions.csv / confusion_matrix.png
+          wrong/          判斷錯誤的圖，六聯圖，檔名 {OK_or_NG}_{來源}{id}.png
+          visualize_all/  全部圖，六聯圖，檔名同上
+          bbox_top5/      前景 mIoU 最高的 5 張，檔名 {排名}_{iou}_{來源}{id}.png，
+                          IoU 排名跟 mean IoU 也會寫進 report.txt 最後一段
+
+        六聯圖排版 (3 列 2 欄，輸出是 bbox 不是 segmentation 填色):
+          原圖              | 原圖 + GT bbox (綠框)
+          原圖 + predict bbox (紅框) | 原圖 + GT(綠) + predict(紅) 疊在一起比對
+          heatmap           | heatmap 疊在原圖上
+
+        bbox 做法: 把二值化後的 predict_mask 做連通元件 (cv2.findContours)，
+        每一塊各自取外接矩形當作一個 predict bbox；GT 因為 to_mice.py 本來就是
+        用矩形填出來的 (DeepPCB 只有 bbox 標註，沒有真正的瑕疵形狀)，直接對
+        GT mask 做同樣的連通元件也能還原出原始 bbox。前景 IoU 用像素級
+        intersection/union 算，天生就處理了一張圖有多個瑕疵框的情況，不需要
+        額外做 box-to-box 配對。
+
+        來源縮寫: g=test/good, d=test/defect, o=other_fake。同一個 stem 在
+        good/defect 之間可能重複 (範本圖跟它的瑕疵版本共用檔名)，所以檔名一定要
+        帶來源縮寫，不能只用 id，否則會互相覆蓋。
         """
         group_dir = Path(group_dir)
-        out_dir = Path(out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
+        pred_dir = Path(self.results_path) / "analyze results" / group_id
+        pred_dir.mkdir(parents=True, exist_ok=True)
+        viz_dir = pred_dir / "visualize_all"
+        wrong_dir = pred_dir / "wrong"
 
         img_tf = transforms.Compose([
             transforms.Resize(resize),
@@ -634,11 +700,11 @@ class MICE(torch.nn.Module):
             transforms.ToTensor(),
         ])
 
-        # (子資料夾, 對應的 GT mask 資料夾或 None=一律視為無瑕疵)
+        # (子資料夾, 對應的 GT mask 資料夾或 None=一律視為無瑕疵, 來源縮寫, image-level label)
         sources = [
-            ("test/good", None),
-            ("test/defect", "ground_truth/defect"),
-            ("other_fake", "other_fake_masks"),
+            ("test/good", None, "g", 0),
+            ("test/defect", "ground_truth/defect", "d", 1),
+            ("other_fake", "other_fake_masks", "o", 1),
         ]
 
         self.forward_modules.eval()
@@ -646,9 +712,9 @@ class MICE(torch.nn.Module):
             self.pre_projection.eval()
         self.discriminator.eval()
 
-        # ── 第一階段: 跑推論，把結果都留著 ──────────────────────
-        items = []  # (sub, stem, orig_bgr, seg_map, gt_arr)
-        for sub, mask_sub in sources:
+        # ── 第一階段: 跑推論，把結果都留著 (score + seg map + GT) ──────
+        items = []  # (src_tag, label, stem, path, orig_bgr, score, seg_map, gt_arr)
+        for sub, mask_sub, src_tag, label in sources:
             img_dir = group_dir / sub
             if not img_dir.is_dir():
                 continue
@@ -659,7 +725,8 @@ class MICE(torch.nn.Module):
                 img_t = img_tf(pil_img).unsqueeze(0)
 
                 with torch.no_grad():
-                    _, seg = self._predict(img_t)
+                    score, seg = self._predict(img_t)
+                score = float(np.asarray(score).ravel()[0])
                 seg = seg[0]  # (H, W)，已經是 self.input_shape 的解析度
 
                 if mask_sub is not None and (group_dir / mask_sub / f"{p.stem}.png").exists():
@@ -669,40 +736,235 @@ class MICE(torch.nn.Module):
                     gt_arr = np.zeros(seg.shape, dtype=np.uint8)
 
                 orig = utils.torch_format_2_numpy_img(img_t[0].cpu().numpy())
-                items.append((sub, p.stem, orig, seg, gt_arr))
+                items.append((src_tag, label, p.stem, str(p), orig, score, seg, gt_arr))
 
         if not items:
-            LOGGER.info(f"visualize_all: {group_dir} 底下找不到圖")
-            return 0
+            LOGGER.info(f"final_test: {group_dir} 底下找不到圖")
+            return None
 
-        # ── 搜尋這個 group 專屬的 pixel 門檻 ──────────────────────
-        all_segs = np.stack([it[3] for it in items])
-        all_gts = (np.stack([it[4] for it in items]) > 0).astype(np.uint8)
-        pix_thr = metrics.search_best_pixel_threshold(all_segs, all_gts, criterion="f1")["threshold"]
-        LOGGER.info(f"visualize_all: pixel threshold = {pix_thr:.4f} "
-                    f"(self.threshold={self.threshold:.4f} 是 image-level 的，這裡不能共用)")
+        scores = np.array([it[5] for it in items])
+        labels_gt = np.array([it[1] for it in items])
+        img_paths = [it[3] for it in items]
+        segmentations = np.stack([it[6] for it in items])
+        masks_gt = (np.stack([it[7] for it in items]) > 0).astype(np.uint8)
 
-        # ── 第二階段: 二值化、存四聯圖 ──────────────────────
-        for sub, stem, orig, seg, gt_arr in items:
-            pred_arr = ((seg - pix_thr) > 0).astype(np.uint8) * 255
+        # ── 決定門檻 ──────────────────────────────────────────────
+        # fixed/percentile: 沿用 self.threshold (跟驗證集同一顆，可部署)。
+        # oracle_f1/oracle_acc: 直接在這批展開後的 test 分數上重新搜，不是沿用
+        # 驗證集搜出來的值 —— oracle 本來就該回答「這批 test 最好能到多少」。
+        if self.thr_mode == "oracle_f1":
+            test_threshold = metrics.search_best_threshold(scores, labels_gt, criterion="f1")["threshold"]
+        elif self.thr_mode == "oracle_acc":
+            test_threshold = metrics.search_best_threshold(scores, labels_gt, criterion="acc")["threshold"]
+        else:
+            test_threshold = self.threshold
 
-            gt_rgb = cv2.cvtColor(gt_arr, cv2.COLOR_GRAY2BGR)
-            pred_rgb = cv2.cvtColor(pred_arr, cv2.COLOR_GRAY2BGR)
+        cls = metrics.compute_classification_metrics(scores, labels_gt, threshold=test_threshold)
 
-            overlay = orig.copy()
-            red = np.zeros_like(orig)
-            red[..., 2] = 255  # BGR，紅色標前景
-            mask_bool = pred_arr > 0
-            overlay[mask_bool] = cv2.addWeighted(orig, 0.4, red, 0.6, 0)[mask_bool]
+        # ── 門檻無關指標: image/pixel AUROC、PRO，一樣算在這批展開後的 test 上 ──
+        img_ret = metrics.compute_imagewise_retrieval_metrics(scores, labels_gt, path='eval')
+        pix_ret = metrics.compute_pixelwise_retrieval_metrics(segmentations, masks_gt, path='eval')
+        try:
+            pro_masks, pro_segs = masks_gt, segmentations
+            pro_limit = 200
+            if len(pro_masks) > pro_limit:
+                sel = np.random.default_rng(0).choice(len(pro_masks), pro_limit, replace=False)
+                pro_masks, pro_segs = pro_masks[sel], pro_segs[sel]
+            pixel_pro = metrics.compute_pro(pro_masks, pro_segs)
+        except Exception:
+            pixel_pro = 0.
 
-            panel = np.hstack([orig, gt_rgb, pred_rgb, overlay])
-            panel = cv2.resize(panel, (256 * 4, 256))
+        # ── pixel 門檻: 這個 group 專屬，用來把 predict_mask 二值化 (純視覺化用，
+        #    不是 test_threshold —— 那是 image-level 門檻，套在像素上幾乎必定全黑：
+        #    image score = 該圖所有 patch 取 max，天生比大多數像素分數高一截) ──
+        # 固定用 F1 準則，不跟著 thr_mode 走: pixel-level 前景(瑕疵)/背景嚴重不平衡，
+        # 背景像素數量壓倒性地多，accuracy 準則會傾向「幾乎全判背景」也能拿高分
+        # (實測過，mask 會變得很稀疏、破碎)，F1 同時要求 precision/recall 才不會這樣。
+        #
+        # 曾經試過「每張圖各自搜一顆 oracle 門檻」(用那張圖自己的 GT 反推)，
+        # 實測 (90100 這組) mIoU/AP 幾乎沒變 (0.2706->0.2824, 19.33%->19.36%)，
+        # 但每個 group 要多跑 1~10 分鐘。結論: 框圈不準的瓶頸不是門檻選多少，
+        # 是 segmentation map 本身定位不夠準 (Gaussian blur 把分數峰值抹開)，
+        # 換門檻救不了，所以改回群組共用一顆、快很多。
+        pix_criterion = "f1"
+        pix_thr = metrics.search_best_pixel_threshold(segmentations, masks_gt, criterion=pix_criterion)["threshold"]
+        pix_thrs = [pix_thr] * len(items)
+        LOGGER.info(f"final_test: pixel threshold = {pix_thr:.4f} (criterion={pix_criterion}) "
+                    f"(test_threshold={test_threshold:.4f} 是 image-level 的，這裡不能共用)")
 
-            sub_flat = sub.replace("/", "_")
-            cv2.imwrite(str(out_dir / f"{sub_flat}__{stem}.png"), panel)
+        # ── segmentation -> bbox 工具: 對二值化 predict_mask 做連通元件，每一塊
+        #    各自取外接矩形。GT 本身在 to_mice.py 就是用 bbox 填出來的矩形，不是
+        #    真正的瑕疵形狀，對 GT mask 做同樣的連通元件也能還原出原始 bbox。
+        RED, GREEN = (0, 0, 255), (0, 255, 0)
+        # clean=True (只給 predict_mask 用，GT 不動): open 去掉孤立小雜訊點，
+        # close 把同一個瑕疵被 Gaussian blur 切碎的鄰近小區塊補起來合併，
+        # 再丟掉面積太小的連通元件 —— 這三步是專門用來解決「零星小框框」問題的。
+        MIN_BOX_AREA = min_box_area  # px^2，資料集是 640x640，小於這個面積視為雜訊
+        MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
 
-        LOGGER.info(f"visualize_all: {len(items)} 張圖存到 {out_dir} (pixel threshold={pix_thr:.4f})")
-        return len(items)
+        def mask_to_boxes(mask_bin, clean=False):
+            m = mask_bin.astype(np.uint8) * 255
+            if clean:
+                m = cv2.morphologyEx(m, cv2.MORPH_OPEN, MORPH_KERNEL)
+                m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, MORPH_KERNEL)
+            contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            boxes = [cv2.boundingRect(c) for c in contours]
+            if clean:
+                boxes = [b for b in boxes if b[2] * b[3] >= MIN_BOX_AREA]
+            return boxes
+
+        def boxes_to_mask(boxes, shape):
+            m = np.zeros(shape, dtype=bool)
+            for (x, y, w, h) in boxes:
+                m[y:y + h, x:x + w] = True
+            return m
+
+        def draw_boxes(img, boxes, color):
+            out = img.copy()
+            for (x, y, w, h) in boxes:
+                cv2.rectangle(out, (x, y), (x + w, y + h), color, 2)
+            return out
+
+        # ── Detection AP@IoU0.5: 標準物件偵測評估方式，整個 group 一個數字，
+        #    不是單張圖的分數。每個 predict box 的信心值 = 該框範圍內 segmentation
+        #    分數的最大值，所有圖的框依信心值排序後配對 GT (同一張圖內 IoU>=0.5
+        #    才算命中，一個 GT 只能配一次)，算 precision-recall 曲線下面積。
+        predictions_for_ap = []
+        gts_per_image = {}
+        for idx, it in enumerate(items):
+            seg_i, gt_arr_i = it[6], it[7]
+            gt_boxes_i = mask_to_boxes(gt_arr_i > 0, clean=False)
+            gts_per_image[idx] = gt_boxes_i
+            pred_boxes_i = mask_to_boxes((seg_i - pix_thrs[idx]) > 0, clean=True)
+            for (x, y, w, h) in pred_boxes_i:
+                conf = float(seg_i[y:y + h, x:x + w].max()) if w > 0 and h > 0 else 0.
+                predictions_for_ap.append((idx, (x, y, w, h), conf))
+        detection_ap = metrics.compute_detection_ap(predictions_for_ap, gts_per_image, iou_thresh=0.5)
+        LOGGER.info(f"final_test: Detection AP@0.5 = {detection_ap:.4f} "
+                    f"({len(predictions_for_ap)} 個 predict box, "
+                    f"{sum(len(v) for v in gts_per_image.values())} 個 GT box)")
+
+        extra_metrics = {
+            "I-AUROC": img_ret["auroc"],
+            "P-AUROC": pix_ret["auroc"],
+            "P-PRO": pixel_pro,
+            "AP@0.5(bbox)": detection_ap,
+        }
+
+        report_txt = pred_dir / "report.txt"
+        utils.write_eval_report(cls, group_id, img_paths, labels_gt, scores, test_threshold,
+                                str(report_txt), single_class=False, extra_metrics=extra_metrics,
+                                pixel_threshold=pix_thr)
+        LOGGER.info(f"final_test report -> {report_txt} (threshold={test_threshold:.4f}, "
+                    f"thr_mode={self.thr_mode})")
+
+        pred_csv = pred_dir / "predictions.csv"
+        with open(pred_csv, mode='w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(["image_path", "source", "label", "label_name", "score", "pred", "correct"])
+            for it, sc in zip(items, scores):
+                lab = it[1]
+                pred = int(sc >= test_threshold)
+                w.writerow([it[3], it[0], lab, "fake" if lab else "good", f"{float(sc):.6f}",
+                            pred, int(pred == lab)])
+        LOGGER.info(f"final_test predictions -> {pred_csv}")
+
+        cm_png = pred_dir / "confusion_matrix.png"
+        utils.plot_confusion_matrix(cls, group_id, str(cm_png))
+        LOGGER.info(f"final_test confusion matrix -> {cm_png}")
+
+        seg_min, seg_max = float(segmentations.min()), float(segmentations.max())
+
+        def six_panel(orig, seg, gt_arr, thr):
+            pred_bin = (seg - thr) > 0
+            gt_bin = gt_arr > 0
+            pred_boxes = mask_to_boxes(pred_bin, clean=True)
+            gt_boxes = mask_to_boxes(gt_bin, clean=False)
+
+            gt_panel = draw_boxes(orig, gt_boxes, GREEN)
+            pred_panel = draw_boxes(orig, pred_boxes, RED)
+            compare_panel = draw_boxes(draw_boxes(orig, gt_boxes, GREEN), pred_boxes, RED)
+
+            seg_norm = (seg - seg_min) / (seg_max - seg_min + 1e-8)
+            heat = cv2.applyColorMap((seg_norm * 255).astype('uint8'), cv2.COLORMAP_JET)
+            heat_overlay = cv2.addWeighted(orig.astype('uint8'), 0.6, heat, 0.4, 0)
+
+            cell = (256, 256)
+            row1 = np.hstack([cv2.resize(orig, cell), cv2.resize(gt_panel, cell)])
+            row2 = np.hstack([cv2.resize(pred_panel, cell), cv2.resize(compare_panel, cell)])
+            row3 = np.hstack([cv2.resize(heat, cell), cv2.resize(heat_overlay, cell)])
+            return np.vstack([row1, row2, row3])
+
+        preds = (scores >= test_threshold).astype(int)
+
+        if save_visualizations:
+            shutil.rmtree(viz_dir, ignore_errors=True)
+            viz_dir.mkdir(parents=True, exist_ok=True)
+            for it, pred, thr in zip(items, preds, pix_thrs):
+                src_tag, lab, stem, _, orig, _, seg, gt_arr = it
+                ok_ng = "OK" if pred == lab else "NG"
+                panel = six_panel(orig, seg, gt_arr, thr)
+                cv2.imwrite(str(viz_dir / f"{ok_ng}_{src_tag}{stem}.png"), panel)
+            LOGGER.info(f"final_test: {len(items)} 張圖存到 {viz_dir}")
+
+        # ── 判斷錯誤的圖另存一份，方便不用在 visualize_all 裡大海撈針 ──
+        shutil.rmtree(wrong_dir, ignore_errors=True)
+        wrong_dir.mkdir(parents=True, exist_ok=True)
+        n_wrong = 0
+        for it, pred, thr in zip(items, preds, pix_thrs):
+            src_tag, lab, stem, _, orig, _, seg, gt_arr = it
+            if pred == lab:
+                continue
+            n_wrong += 1
+            panel = six_panel(orig, seg, gt_arr, thr)
+            cv2.imwrite(str(wrong_dir / f"NG_{src_tag}{stem}.png"), panel)
+        LOGGER.info(f"final_test: {n_wrong} 張判錯的圖存到 {wrong_dir}")
+
+        # ── 前景 mIoU 最高的 5 張，證明 bbox 圈得準不準 ────────────────
+        # IoU 用「清乾淨、過濾小雜訊後的 predict bbox」去算 (跟六聯圖畫出來的
+        # 框是同一份)，不是拿原始未過濾的 pixel mask 算，這樣數字才跟視覺化
+        # 對得起來。只對「本來就有 GT」的圖 (test/defect + other_fake 裡有
+        # 標到瑕疵的) 算，test/good 沒有前景可比，排除在外。
+        ious = []
+        for it, thr in zip(items, pix_thrs):
+            gt_bin = it[7] > 0
+            if not gt_bin.any():
+                ious.append(None)
+                continue
+            pred_bin_raw = (it[6] - thr) > 0
+            pred_boxes = mask_to_boxes(pred_bin_raw, clean=True)
+            pred_bin = boxes_to_mask(pred_boxes, gt_bin.shape)
+            inter = int(np.logical_and(pred_bin, gt_bin).sum())
+            union = int(np.logical_or(pred_bin, gt_bin).sum())
+            ious.append(inter / union if union > 0 else 0.)
+
+        valid = sorted([(i, v) for i, v in enumerate(ious) if v is not None],
+                       key=lambda x: -x[1])
+        top5 = valid[:5]
+
+        bbox_dir = pred_dir / "bbox_top5"
+        shutil.rmtree(bbox_dir, ignore_errors=True)
+        bbox_dir.mkdir(parents=True, exist_ok=True)
+        top5_lines = []
+        for rank, (i, iou) in enumerate(top5, 1):
+            src_tag, lab, stem, _, orig, _, seg, gt_arr = items[i]
+            panel = six_panel(orig, seg, gt_arr, pix_thrs[i])
+            cv2.imwrite(str(bbox_dir / f"{rank}_{iou:.3f}_{src_tag}{stem}.png"), panel)
+            top5_lines.append(f"  {rank}. {src_tag}{stem}   IoU = {iou:.4f}")
+        LOGGER.info(f"final_test: top5 bbox IoU 圖存到 {bbox_dir}")
+
+        with open(report_txt, "a") as f:
+            f.write("\n" + "-" * 72 + "\n")
+            f.write(f"TOP 5 BBOX (前景 mIoU 最高，共 {len(valid)} 張有 GT 可比較)\n")
+            f.write("-" * 72 + "\n")
+            if top5_lines:
+                mean_iou = sum(v for _, v in valid) / len(valid)
+                f.write(f"mean IoU (全部有 GT 的圖) : {mean_iou:.4f}\n\n")
+                f.write("\n".join(top5_lines) + "\n")
+            else:
+                f.write("  (這個 group 沒有帶 GT 的圖，無法算 IoU)\n")
+
+        return {"cls": cls, **extra_metrics, "n": len(items)}
 
     def _evaluate(self, images, scores, segmentations, labels_gt, masks_gt, name, path='training', img_paths=None):
         scores = np.squeeze(np.array(scores))
@@ -720,11 +982,17 @@ class MICE(torch.nn.Module):
         # ── image-level 分類正確率 ────────────────────────────────
         # discriminator 是 sigmoid 輸出且以 BCE (正常->0, 異常->1) 訓練，
         # 門檻: thr_mode='fixed' 時就是 dsc_margin，'percentile' 時是訓練集校準出來的值，
-        # 'oracle_f1' 時直接拿這次 test 的分數搜尋讓 F1 最大的門檻。
-        # 注意: oracle_f1 用了 test 標籤去挑門檻，是樂觀上界，不是可部署的校準方式，
-        # 只適合「就是要在這批固定的 test 圖上報最好的 F1」這種用途 (常見於論文報表)。
+        # 'oracle_f1'/'oracle_acc' 時直接拿這次 test (驗證集) 的分數搜尋讓 F1/accuracy
+        # 最大的門檻。
+        # 注意: oracle_f1/oracle_acc 用了 test 標籤去挑門檻，是樂觀上界，不是可部署的
+        # 校準方式，只適合「就是要在這批固定的 test 圖上報最好的數字」這種用途
+        # (常見於論文報表)。這裡的 test 是驗證集 (1:1 平衡)，算出來的 self.threshold
+        # 只給 fixed/percentile 模式的 final_test() 沿用；oracle_f1/oracle_acc 模式
+        # final_test() 會在展開後的完整 test 上重新搜一次，不是沿用這裡的值。
         if self.thr_mode == "oracle_f1" and not self.single_class_test:
             self.threshold = metrics.search_best_threshold(scores, labels_gt, criterion="f1")["threshold"]
+        elif self.thr_mode == "oracle_acc" and not self.single_class_test:
+            self.threshold = metrics.search_best_threshold(scores, labels_gt, criterion="acc")["threshold"]
 
         cls = metrics.compute_classification_metrics(scores, labels_gt, threshold=self.threshold)
         if self.single_class_test:
@@ -742,10 +1010,15 @@ class MICE(torch.nn.Module):
             cls["best_f1_threshold"] = cls_best_f1["threshold"]
 
         # 逐張影像的預測結果 (只在最終 eval 時輸出，訓練中每個 epoch 寫會太吵)
+        # 注意: 這裡的 img_paths/labels_gt 來自 1:1 平衡的 test/good vs test/defect
+        # (驗證集，用來校準門檻/挑 best ckpt)，不是最終展開 other_fake 的 test。
+        # 所以檔名一律加 val_ 前綴，跟 final_test() 產生的正式 report 分開放，
+        # 但共用同一個 <group_id> 資料夾，不要讓 analyze results 底下散一堆檔案。
         if path == 'eval' and img_paths is not None:
-            pred_dir = os.path.join(self.results_path, "analyze results")
+            group_id = name.split("_", 1)[1] if "_" in name else name
+            pred_dir = os.path.join(self.results_path, "analyze results", group_id)
             os.makedirs(pred_dir, exist_ok=True)
-            pred_csv = os.path.join(pred_dir, f"predictions_{name}.csv")
+            pred_csv = os.path.join(pred_dir, "val_predictions.csv")
             with open(pred_csv, mode='w', newline='') as f:
                 w = csv.writer(f)
                 w.writerow(["image_path", "label", "label_name", "score", "pred", "correct"])
@@ -756,16 +1029,14 @@ class MICE(torch.nn.Module):
             LOGGER.info(f"Per-image predictions written to {pred_csv}")
 
             # 人看的報告 (含混淆矩陣與逐張對錯，判錯的排最前面)
-            report_txt = os.path.join(pred_dir, f"report_{name}.txt")
+            report_txt = os.path.join(pred_dir, "val_report.txt")
             utils.write_eval_report(cls, name, img_paths, labels_gt,
                                     np.asarray(scores).ravel(), self.threshold,
                                     report_txt, single_class=self.single_class_test)
             LOGGER.info(f"Evaluation report written to {report_txt}")
 
             if not self.single_class_test:
-                cm_dir = os.path.join(self.results_path, path, name)
-                os.makedirs(cm_dir, exist_ok=True)
-                cm_png = os.path.join(cm_dir, "confusion_matrix.png")
+                cm_png = os.path.join(pred_dir, "val_confusion_matrix.png")
                 utils.plot_confusion_matrix(cls, name, cm_png)
                 LOGGER.info(f"Confusion matrix written to {cm_png}")
 
@@ -845,7 +1116,13 @@ class MICE(torch.nn.Module):
 
             return cv2.resize(np.hstack(panels), (256 * len(panels), 256))
 
-        full_path = os.path.join(self.results_path, path, name) + '/'
+        # path='eval' (驗證集最終校驗) 的樣本圖跟 wrong 都收進 <group_id> 資料夾，
+        # 加 val_ 前綴跟 final_test() 的正式報告分開；path='training' (訓練中每個
+        # epoch 抽查) 維持原本 results_path/training/<name>/ 不變。
+        if path == 'eval' and img_paths is not None:
+            full_path = os.path.join(pred_dir, "val_samples") + '/'
+        else:
+            full_path = os.path.join(self.results_path, path, name) + '/'
         utils.del_remake_dir(full_path, del_flag=False)
 
         for idx, orig_idx in enumerate(save_indices):
@@ -865,7 +1142,7 @@ class MICE(torch.nn.Module):
             fn_idx = sorted(np.where((labels_arr == 1) & (preds == 0))[0], key=lambda i: score_arr[i])
             fp_idx = sorted(np.where((labels_arr == 0) & (preds == 1))[0], key=lambda i: -score_arr[i])
 
-            wrong_dir = os.path.join(full_path, "wrong")
+            wrong_dir = os.path.join(pred_dir, "val_wrong")
             shutil.rmtree(wrong_dir, ignore_errors=True)
             os.makedirs(wrong_dir, exist_ok=True)
 

@@ -148,8 +148,18 @@ def plot_confusion_matrix(cls, name, out_path):
 
 
 def write_eval_report(cls, name, img_paths, labels_gt, scores, threshold, out_path,
-                      single_class=False):
-    """把 test set 每張圖的預測結果寫成人看的 txt，判錯的排在最前面。"""
+                      single_class=False, extra_metrics=None, pixel_threshold=None,
+                      pixel_threshold_is_oracle=False):
+    """把 test set 每張圖的預測結果寫成人看的 txt，判錯的排在最前面。
+
+    extra_metrics: 選填，例如 {"I-AUROC": .., "P-AUROC": .., "P-PRO": ..}，
+    門檻無關的排序/分割指標，印在分類指標下面。
+    pixel_threshold: 選填，visualize_all 二值化 predict_mask 用的 pixel 門檻
+    (跟 threshold 是不同單位，image-level vs pixel-level，不能共用)。
+    pixel_threshold_is_oracle: pixel_threshold 是不是「每張圖各自拿自己的 GT
+    反推出來的」平均值 —— 不是可部署的方法，只是這批圖各自的分數最多能標多準
+    的上界，True 時會在報告裡明講，避免被誤會成一個固定、可重現的門檻。
+    """
     rows = []
     for p, lab, sc in zip(img_paths, labels_gt, scores):
         lab = int(lab)
@@ -169,6 +179,14 @@ def write_eval_report(cls, name, img_paths, labels_gt, scores, threshold, out_pa
         f.write(f"Evaluation report: {name}\n")
         f.write("=" * 72 + "\n")
         f.write(f"threshold            : {threshold:.4f}\n")
+        if pixel_threshold is not None:
+            if pixel_threshold_is_oracle:
+                f.write(f"pixel threshold      : {pixel_threshold:.4f}  "
+                        f"(每張圖各自拿自己的 GT 反推出來的平均值，逐張不同、非固定門檻，"
+                        f"不可部署，只是這批圖各自分數最多能標多準的上界)\n")
+            else:
+                f.write(f"pixel threshold      : {pixel_threshold:.4f}  "
+                        f"(visualize_all predict_mask 二值化用，跟上面的 image-level threshold 不同單位)\n")
         f.write(f"total test images    : {len(rows)}\n")
         f.write(f"  actual good        : {sum(1 for r in rows if r['actual'] == 'good')}\n")
         f.write(f"  actual fake        : {sum(1 for r in rows if r['actual'] == 'fake')}\n")
@@ -186,7 +204,11 @@ def write_eval_report(cls, name, img_paths, labels_gt, scores, threshold, out_pa
             f.write(f"precision (fake)     : {cls['precision'] * 100:.2f} %\n")
             f.write(f"recall  fake / good  : {cls['recall_fake'] * 100:.2f} % / "
                     f"{cls['recall_real'] * 100:.2f} %\n")
-            f.write(f"f1 (fake)            : {cls['f1'] * 100:.2f} %\n\n")
+            f.write(f"f1 (fake)            : {cls['f1'] * 100:.2f} %\n")
+            if extra_metrics:
+                for k, v in extra_metrics.items():
+                    f.write(f"{k:<21}: {v * 100:.2f} %\n")
+            f.write("\n")
 
         def dump(title, items):
             f.write("-" * 72 + "\n")

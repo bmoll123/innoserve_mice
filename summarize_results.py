@@ -1,14 +1,18 @@
 """
-把一次 --results_path 底下所有 group 的結果彙整成一份 report.txt。
+把一次 --results_path 底下所有 group 的最終測試結果彙整成一份 report.txt。
 
 資料來源 (只讀現有檔案，不會重新推論):
-  <results_path>/results.csv                                   每 group 一列: AUROC/AP/PRO/best_epoch(/best_f1，若有)
-  <results_path>/analyze results/report_mvtec_<gid>.txt         固定門檻下的混淆矩陣/acc/recall
-  <results_path>/analyze results/training_log_mvtec_<gid>.csv   最後一列: oracle 門檻 (best_acc/best_balanced_acc/best_f1)
+  <results_path>/results.csv                                 每 group 一列: best_epoch (訓練資訊，非分類指標)
+  <results_path>/analyze results/<gid>/report.txt             final_test() 產生，展開 test/good vs
+                                                                (test/defect+other_fake) 的完整測試結果
   <data_path>/<gid>/{train/good, test/good, test/defect, other_fake}  各資料夾張數
 
+report.txt 裡的 accuracy/balanced accuracy/precision/recall/f1/I-AUROC/P-AUROC/P-PRO
+全部來自同一次評估 (final_test，門檻沿用驗證集校準出來的 self.threshold，不是用這批
+test 的答案重新挑門檻)，是這個 group 唯一一份「正式」的測試報告。
+
 用法:
-  python summarize_results.py --results_path results/pcb_groups_k=0.25
+  python summarize_results.py --results_path "results/pcb_groups_k=0.25"
 """
 
 import argparse
@@ -51,18 +55,6 @@ def read_results_csv(path: Path):
     return rows
 
 
-def read_training_log_last_row(path: Path):
-    if not path.exists():
-        return {}
-    with open(path) as f:
-        rows = list(csv.DictReader(f))
-    # 最後一列不一定是有評估的那列 (eval_epochs 間隔)，往回找第一列有算過分類指標的
-    for row in reversed(rows):
-        if row.get("best_threshold", "0") not in ("", "0", "0.0000"):
-            return row
-    return rows[-1] if rows else {}
-
-
 def parse_report_txt(path: Path):
     if not path.exists():
         return {}
@@ -70,11 +62,17 @@ def parse_report_txt(path: Path):
     out = {}
     patterns = {
         "threshold": r"^threshold\s*:\s*([\d.]+)",
+        "pixel_threshold": r"^pixel threshold\s*:\s*([\d.]+)",
         "accuracy": r"^accuracy\s*:\s*([\d.]+)",
         "balanced_accuracy": r"^balanced accuracy\s*:\s*([\d.]+)",
+        "precision": r"^precision \(fake\)\s*:\s*([\d.]+)",
         "f1": r"^f1 \(fake\)\s*:\s*([\d.]+)",
         "recall_fake": r"^recall\s+fake / good\s*:\s*([\d.]+)",
         "recall_good": r"^recall\s+fake / good\s*:\s*[\d.]+\s*%\s*/\s*([\d.]+)",
+        "i_auroc": r"^I-AUROC\s*:\s*([\d.]+)",
+        "p_auroc": r"^P-AUROC\s*:\s*([\d.]+)",
+        "p_pro": r"^P-PRO\s*:\s*([\d.]+)",
+        "ap_bbox": r"^AP@0\.5\(bbox\)\s*:\s*([\d.]+)",
         "wrong": r"^wrong predictions\s*:\s*(\d+)",
     }
     for key, pat in patterns.items():
@@ -114,29 +112,36 @@ def main():
     analyze_dir = args.results_path / "analyze results"
     out_path = args.out or (analyze_dir / "report.txt")
 
-    csv_rows = read_results_csv(results_csv)
-    if not csv_rows:
-        raise SystemExit(f"讀不到 {results_csv}，確認 --results_path 對不對")
+    if not analyze_dir.is_dir():
+        raise SystemExit(f"讀不到 {analyze_dir}，確認 --results_path 對不對，且已經跑過 final_test()")
 
-    gids = sorted(csv_rows.keys())
+    gids = sorted(p.name for p in analyze_dir.iterdir()
+                 if p.is_dir() and (p / "report.txt").exists())
+    if not gids:
+        raise SystemExit(f"{analyze_dir} 底下沒有任何 <group_id>/report.txt，"
+                         f"確認 main.py 有跑完 tester() (需要有 ckpt_best 才會執行 final_test)")
+
+    csv_rows = read_results_csv(results_csv)
     data_missing = not args.data_path.is_dir()
     lines = []
     lines.append(f"Summary report — {args.results_path}")
-    lines.append(f"共 {len(gids)} 個 group")
+    lines.append(f"共 {len(gids)} 個 group  (final_test: test/good vs test/defect+other_fake)")
     if data_missing:
         lines.append(f"注意: 資料集路徑 {args.data_path} 已不存在，張數欄位全部顯示 N/A")
-    lines.append("=" * 100)
+    lines.append("=" * 112)
     lines.append("")
 
     # ── 總覽表 ──────────────────────────────────────────────
-    header = (f"{'group':<8} {'train':>6} {'test_g':>7} {'test_f':>7} {'other':>6} | "
-              f"{'I-AUROC':>8} {'P-AUROC':>8} {'P-PRO':>7} {'epoch':>6} | "
-              f"{'acc':>7} {'bacc':>7} {'thr':>6} | {'best_bacc':>9} {'best_f1':>8}")
+    header = (f"{'group':<8} {'train':>6} {'test_g':>7} {'test_f':>7} {'other':>6} {'epoch':>6} | "
+              f"{'cls_thr':>7} {'pix_thr':>7} | "
+              f"{'acc':>7} {'bacc':>7} {'prec':>7} {'rec_f':>7} {'rec_g':>7} {'f1':>7} | "
+              f"{'I-AUROC':>8} {'P-AUROC':>8} {'P-PRO':>7} {'AP@.5':>7}")
     lines.append(header)
     lines.append("-" * len(header))
 
     agg = {"train": 0, "test_g": 0, "test_f": 0, "other": 0}
-    auroc_vals, bacc_vals = [], []
+    reports = {}
+    auroc_vals, bacc_vals, f1_vals, ap_vals = [], [], [], []
 
     for gid in gids:
         g = args.data_path / gid
@@ -147,59 +152,76 @@ def main():
         for key, v in (("train", n_train), ("test_g", n_test_g), ("test_f", n_test_f), ("other", n_other)):
             agg[key] += v or 0
 
-        row = csv_rows[gid]
-        report = parse_report_txt(analyze_dir / f"report_mvtec_{gid}.txt")
-        last = read_training_log_last_row(analyze_dir / f"training_log_mvtec_{gid}.csv")
+        report = parse_report_txt(analyze_dir / gid / "report.txt")
+        reports[gid] = report
+        epoch = (csv_rows.get(gid, {}) or {}).get("best_epoch", "N/A")
 
-        i_auroc = float(row.get("image_auroc", 0) or 0)
-        p_auroc = float(row.get("pixel_auroc", 0) or 0)
-        p_pro = float(row.get("pixel_pro", 0) or 0)
-        epoch = row.get("best_epoch", "N/A")
-        best_bacc = last.get("best_balanced_acc", "")
-        best_f1_col = row.get("best_f1") or last.get("best_f1", "")
+        i_auroc = float(report.get("i_auroc", 0) or 0) / 100
+        p_auroc = float(report.get("p_auroc", 0) or 0) / 100
+        p_pro = float(report.get("p_pro", 0) or 0) / 100
+        bacc = report.get("balanced_accuracy")
+        f1 = report.get("f1")
 
-        if best_bacc:
-            bacc_vals.append(float(best_bacc))
-        auroc_vals.append(i_auroc)
+        if report.get("i_auroc"):
+            auroc_vals.append(i_auroc)
+        if bacc:
+            bacc_vals.append(float(bacc) / 100)
+        if f1:
+            f1_vals.append(float(f1) / 100)
+        if report.get("ap_bbox"):
+            ap_vals.append(float(report["ap_bbox"]) / 100)
 
         lines.append(
             f"{gid:<8} {fmt_count(n_train):>6} {fmt_count(n_test_g):>7} "
-            f"{fmt_count(n_test_f):>7} {fmt_count(n_other):>6} | "
-            f"{i_auroc:>8.4f} {p_auroc:>8.4f} {p_pro:>7.4f} {epoch:>6} | "
-            f"{fpct(report.get('accuracy'), '  N/A'):>7} "
-            f"{fpct(report.get('balanced_accuracy'), '  N/A'):>7} "
-            f"{fnum(report.get('threshold'), ' N/A'):>6} | "
-            f"{fpct(best_bacc, '     N/A'):>9} "
-            f"{fpct(best_f1_col, '    N/A'):>8}"
+            f"{fmt_count(n_test_f):>7} {fmt_count(n_other):>6} {epoch:>6} | "
+            f"{fnum(report.get('threshold'), '    N/A'):>7} "
+            f"{fnum(report.get('pixel_threshold'), '    N/A'):>7} | "
+            f"{fpct(report.get('accuracy'), '   N/A'):>7} "
+            f"{fpct(bacc, '   N/A'):>7} "
+            f"{fpct(report.get('precision'), '   N/A'):>7} "
+            f"{fpct(report.get('recall_fake'), '   N/A'):>7} "
+            f"{fpct(report.get('recall_good'), '   N/A'):>7} "
+            f"{fpct(f1, '   N/A'):>7} | "
+            f"{fpct(report.get('i_auroc'), '   N/A'):>8} "
+            f"{fpct(report.get('p_auroc'), '   N/A'):>8} "
+            f"{fpct(report.get('p_pro'), '   N/A'):>7} "
+            f"{fpct(report.get('ap_bbox'), '   N/A'):>7}"
         )
 
     lines.append("-" * len(header))
     n = len(gids)
-    lines.append(
-        f"{'TOTAL':<8} {agg['train']:>6} {agg['test_g']:>7} {agg['test_f']:>7} {agg['other']:>6} | "
-        f"{'mean':>8} {'':>8} {'':>7} {'':>6} |"
-    )
-    lines.append(f"  mean I-AUROC      : {sum(auroc_vals)/n:.4f}")
+    lines.append(f"{'TOTAL':<8} {agg['train']:>6} {agg['test_g']:>7} {agg['test_f']:>7} {agg['other']:>6}")
+    if auroc_vals:
+        lines.append(f"  mean I-AUROC          : {sum(auroc_vals)/len(auroc_vals)*100:.2f}%")
     if bacc_vals:
-        lines.append(f"  mean best_bacc     : {sum(bacc_vals)/len(bacc_vals)*100:.2f}%  "
-                     f"(oracle 上界，用 test 標籤挑出來的門檻，不是可部署數字)")
+        lines.append(f"  mean balanced accuracy : {sum(bacc_vals)/len(bacc_vals)*100:.2f}%")
+    if f1_vals:
+        lines.append(f"  mean f1 (fake)         : {sum(f1_vals)/len(f1_vals)*100:.2f}%")
+    if ap_vals:
+        lines.append(f"  mean AP@0.5 (bbox)     : {sum(ap_vals)/len(ap_vals)*100:.2f}%")
     lines.append("")
-    lines.append("=" * 100)
+    lines.append("=" * 112)
     lines.append("欄位說明")
-    lines.append("=" * 100)
+    lines.append("=" * 112)
     lines.append("train/test_g/test_f/other : train/good, test/good, test/defect, other_fake 各自張數")
-    lines.append("I-AUROC/P-AUROC/P-PRO     : 門檻無關的排序/分割指標，來自 results.csv")
-    lines.append("epoch                     : 被選為 best ckpt 的 epoch")
-    lines.append("acc/bacc/thr              : 目前設定的固定門檻下的表現，來自 report_mvtec_<gid>.txt")
-    lines.append("best_bacc/best_f1         : oracle 門檻 (掃描 test 分數找出來的上界)，不代表可部署的真實表現")
+    lines.append("epoch                     : 被選為 best ckpt 的 epoch (來自 results.csv)")
+    lines.append("cls_thr                   : image-level 分類門檻，決定 accuracy 等指標；fixed/percentile")
+    lines.append("                            沿用驗證集校準值，oracle_f1/oracle_acc 直接在這批 test 上搜")
+    lines.append("pix_thr                   : pixel-level 門檻，只給 visualize_all 的 predict_mask 二值化用，")
+    lines.append("                            固定 F1 準則，跟 cls_thr 不同單位、不能互換")
+    lines.append("acc/bacc/prec/rec_f/rec_g/f1 : final_test 在展開後的 test (good vs defect+other_fake) 上，")
+    lines.append("                            用 cls_thr 算出來的分類指標")
+    lines.append("I-AUROC/P-AUROC/P-PRO     : 同一次 final_test，門檻無關的排序/分割指標")
+    lines.append("AP@.5                     : Detection AP@IoU0.5 (bbox)，整個 group 一個數字的物件偵測")
+    lines.append("                            標準指標，不是單張圖的分數；bbox_top5/ 底下的 IoU 才是單張圖分數")
     lines.append("")
 
     # ── 每個 group 的細節 (混淆矩陣) ──────────────────────────
-    lines.append("=" * 100)
-    lines.append("各 group 混淆矩陣 (固定門檻)")
-    lines.append("=" * 100)
+    lines.append("=" * 112)
+    lines.append("各 group 混淆矩陣 (final_test，展開後的 test)")
+    lines.append("=" * 112)
     for gid in gids:
-        report = parse_report_txt(analyze_dir / f"report_mvtec_{gid}.txt")
+        report = reports[gid]
         if not report:
             continue
         lines.append(f"\n[{gid}]  threshold={report.get('threshold', 'N/A')}  "
