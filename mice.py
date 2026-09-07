@@ -640,7 +640,7 @@ class MICE(torch.nn.Module):
         return image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro, epoch, cls["best_f1"], cls["best_f1_threshold"]
 
     def final_test(self, group_dir, group_id, resize, imagesize, save_visualizations=True,
-                   min_box_area=200):
+                   min_box_area=200, pix_thr_mode="f1"):
         """
         最終測試:對 test/good + test/defect + other_fake「全部」圖跑一次推論，
         產生這個 group 的正式報告(取代舊的 visualize_all)。
@@ -658,13 +658,18 @@ class MICE(torch.nn.Module):
             這裡不見得是這批 test 上真正最佳的切點，兩邊都是樂觀上界，但拿哪批
             資料的答案去挑，上界會不一樣。
 
-        輸出全部收在 results_path/analyze results/<group_id>/ (不加 val_ 前綴，
+        輸出大部分收在 results_path/analyze results/<group_id>/ (不加 val_ 前綴，
         跟 tester() 驗證集那份 val_report.txt/val_predictions.csv 分開放):
           report.txt / predictions.csv / confusion_matrix.png
           wrong/          判斷錯誤的圖，六聯圖，檔名 {OK_or_NG}_{來源}{id}.png
           visualize_all/  全部圖，六聯圖，檔名同上
-          bbox_top5/      前景 mIoU 最高的 5 張，檔名 {排名}_{iou}_{來源}{id}.png，
-                          IoU 排名跟 mean IoU 也會寫進 report.txt 最後一段
+
+        bbox_top10 例外，統一收在 results_path/bbox_top10/<group_id>/
+        (不是散在每個 group 自己的 analyze results/<group_id>/ 底下)，方便一次
+        瀏覽所有 group 的框選結果:
+          box 配對 F1 最高的 10 張，檔名 {排名}_{f1}_{來源}{id}.png。每個 predict
+          box 跟 GT box 做 IoU>=0.3 配對 (不用非常準確，但框太大/太偏配不上、
+          框的數量跟 GT 對不上都會扣分)，排名跟 mean F1 也會寫進 report.txt 最後一段
 
         六聯圖排版 (3 列 2 欄，輸出是 bbox 不是 segmentation 填色):
           原圖              | 原圖 + GT bbox (綠框)
@@ -774,28 +779,10 @@ class MICE(torch.nn.Module):
         except Exception:
             pixel_pro = 0.
 
-        # ── pixel 門檻: 這個 group 專屬，用來把 predict_mask 二值化 (純視覺化用，
-        #    不是 test_threshold —— 那是 image-level 門檻，套在像素上幾乎必定全黑：
-        #    image score = 該圖所有 patch 取 max，天生比大多數像素分數高一截) ──
-        # 固定用 F1 準則，不跟著 thr_mode 走: pixel-level 前景(瑕疵)/背景嚴重不平衡，
-        # 背景像素數量壓倒性地多，accuracy 準則會傾向「幾乎全判背景」也能拿高分
-        # (實測過，mask 會變得很稀疏、破碎)，F1 同時要求 precision/recall 才不會這樣。
-        #
-        # 曾經試過「每張圖各自搜一顆 oracle 門檻」(用那張圖自己的 GT 反推)，
-        # 實測 (90100 這組) mIoU/AP 幾乎沒變 (0.2706->0.2824, 19.33%->19.36%)，
-        # 但每個 group 要多跑 1~10 分鐘。結論: 框圈不準的瓶頸不是門檻選多少，
-        # 是 segmentation map 本身定位不夠準 (Gaussian blur 把分數峰值抹開)，
-        # 換門檻救不了，所以改回群組共用一顆、快很多。
-        pix_criterion = "f1"
-        pix_thr = metrics.search_best_pixel_threshold(segmentations, masks_gt, criterion=pix_criterion)["threshold"]
-        pix_thrs = [pix_thr] * len(items)
-        LOGGER.info(f"final_test: pixel threshold = {pix_thr:.4f} (criterion={pix_criterion}) "
-                    f"(test_threshold={test_threshold:.4f} 是 image-level 的，這裡不能共用)")
-
         # ── segmentation -> bbox 工具: 對二值化 predict_mask 做連通元件，每一塊
         #    各自取外接矩形。GT 本身在 to_mice.py 就是用 bbox 填出來的矩形，不是
         #    真正的瑕疵形狀，對 GT mask 做同樣的連通元件也能還原出原始 bbox。
-        RED, GREEN = (0, 0, 255), (0, 255, 0)
+        RED, GREEN, ORANGE = (0, 0, 255), (0, 255, 0), (0, 165, 255)
         # clean=True (只給 predict_mask 用，GT 不動): open 去掉孤立小雜訊點，
         # close 把同一個瑕疵被 Gaussian blur 切碎的鄰近小區塊補起來合併，
         # 再丟掉面積太小的連通元件 —— 這三步是專門用來解決「零星小框框」問題的。
@@ -813,17 +800,63 @@ class MICE(torch.nn.Module):
                 boxes = [b for b in boxes if b[2] * b[3] >= MIN_BOX_AREA]
             return boxes
 
-        def boxes_to_mask(boxes, shape):
-            m = np.zeros(shape, dtype=bool)
-            for (x, y, w, h) in boxes:
-                m[y:y + h, x:x + w] = True
-            return m
-
         def draw_boxes(img, boxes, color):
             out = img.copy()
             for (x, y, w, h) in boxes:
                 cv2.rectangle(out, (x, y), (x + w, y + h), color, 2)
             return out
+
+        # GT box 不受門檻影響，先算好一次，minrisk 搜門檻跟後面的 AP/miss/
+        # false alarm/bbox_top10 都直接重用，不用每次重算。
+        gt_boxes_per_item = [mask_to_boxes(it[7] > 0, clean=False) for it in items]
+
+        # ── pixel 門檻: 這個 group 專屬，用來把 predict_mask 二值化。不是
+        #    test_threshold —— 那是 image-level 門檻，套在像素上幾乎必定全黑：
+        #    image score = 該圖所有 patch 取 max，天生比大多數像素分數高一截。
+        #
+        # 曾經試過「每張圖各自搜一顆 oracle 門檻」(用那張圖自己的 GT 反推)，
+        # 實測 (90100 這組) mIoU/AP 幾乎沒變 (0.2706->0.2824, 19.33%->19.36%)，
+        # 但每個 group 要多跑 1~10 分鐘。結論: 框圈不準的瓶頸不是門檻選多少，
+        # 是 segmentation map 本身定位不夠準 (Gaussian blur 把分數峰值抹開)。
+        #
+        # pix_thr_mode="f1": 群組共用一顆，pixel-level F1 準則，快。
+        # pix_thr_mode="minrisk": 直接搜「讓 2*miss_rate + false_alarm 最低」
+        # 的門檻——這才是真正要優化的目標，但每個候選門檻都要對全部有 GT 的圖
+        # 重新切框、跑一次 match_miss_false_alarm，候選數(預設到 500)乘上圖數，
+        # 明顯比 F1 版慢很多 (使用者已確認接受這個代價，換取更準的搜索)。
+        if pix_thr_mode == "minrisk":
+            scores_pool = segmentations.ravel().astype(np.float32)
+            max_pixels = 2_000_000
+            if scores_pool.size > max_pixels:
+                rng = np.random.default_rng(0)
+                scores_pool = scores_pool[rng.integers(0, scores_pool.size, max_pixels)]
+            candidates = np.unique(scores_pool)
+            if len(candidates) > 500:
+                candidates = np.quantile(candidates, np.linspace(0, 1, 500))
+
+            gt_items = [(idx, gb) for idx, gb in enumerate(gt_boxes_per_item) if gb]
+            best_score, best_thr = None, float(candidates[0]) if len(candidates) else 0.5
+            for t in tqdm.tqdm(candidates, desc="pixel thr (minrisk)", leave=False):
+                total_tp = total_fp = total_fn = 0
+                for idx, gt_boxes_i in gt_items:
+                    pred_boxes_i = mask_to_boxes((items[idx][6] - t) > 0, clean=True)
+                    tp, fp, fn, _, _ = metrics.match_miss_false_alarm(pred_boxes_i, gt_boxes_i, thresh=0.3)
+                    total_tp += tp
+                    total_fp += fp
+                    total_fn += fn
+                miss = total_fn / (total_tp + total_fn) if (total_tp + total_fn) else 0.
+                fa = total_fp / (total_tp + total_fp) if (total_tp + total_fp) else 0.
+                score = 2 * miss + fa
+                if best_score is None or score < best_score:
+                    best_score, best_thr = score, float(t)
+            pix_thr = best_thr
+            LOGGER.info(f"final_test: pixel threshold (minrisk) = {pix_thr:.4f}, "
+                        f"2*miss+false_alarm = {best_score:.4f} ({len(candidates)} 個候選門檻)")
+        else:
+            pix_thr = metrics.search_best_pixel_threshold(segmentations, masks_gt, criterion="f1")["threshold"]
+            LOGGER.info(f"final_test: pixel threshold (f1) = {pix_thr:.4f} "
+                        f"(test_threshold={test_threshold:.4f} 是 image-level 的，這裡不能共用)")
+        pix_thrs = [pix_thr] * len(items)
 
         # ── Detection AP@IoU0.5: 標準物件偵測評估方式，整個 group 一個數字，
         #    不是單張圖的分數。每個 predict box 的信心值 = 該框範圍內 segmentation
@@ -831,11 +864,13 @@ class MICE(torch.nn.Module):
         #    才算命中，一個 GT 只能配一次)，算 precision-recall 曲線下面積。
         predictions_for_ap = []
         gts_per_image = {}
+        preds_per_image = {}
         for idx, it in enumerate(items):
-            seg_i, gt_arr_i = it[6], it[7]
-            gt_boxes_i = mask_to_boxes(gt_arr_i > 0, clean=False)
+            seg_i = it[6]
+            gt_boxes_i = gt_boxes_per_item[idx]
             gts_per_image[idx] = gt_boxes_i
             pred_boxes_i = mask_to_boxes((seg_i - pix_thrs[idx]) > 0, clean=True)
+            preds_per_image[idx] = pred_boxes_i
             for (x, y, w, h) in pred_boxes_i:
                 conf = float(seg_i[y:y + h, x:x + w].max()) if w > 0 and h > 0 else 0.
                 predictions_for_ap.append((idx, (x, y, w, h), conf))
@@ -844,11 +879,49 @@ class MICE(torch.nn.Module):
                     f"({len(predictions_for_ap)} 個 predict box, "
                     f"{sum(len(v) for v in gts_per_image.values())} 個 GT box)")
 
+        # ── Miss rate / False alarm rate: 寬鬆、雙向 coverage>=0.5 判準，
+        #    只要瑕疵有被圈到就算數 (不用框得剛好)，但框太大配不上一樣算錯。
+        #    群組層級池化 (跟 AP@0.5 同一種聚合層級)，不是逐圖平均。
+        #    同一輪順便畫「重疊圖」(左 GT 綠框、右 predict 橘框，predict 已經
+        #    套用跟計數一樣的合併邏輯) 存到 final_output/，只對有 GT 的圖畫，
+        #    test/good 沒有東西可比較。
+        final_output_dir = Path(self.results_path) / "final_output" / group_id
+        shutil.rmtree(final_output_dir, ignore_errors=True)
+        final_output_dir.mkdir(parents=True, exist_ok=True)
+
+        total_tp = total_fp = total_fn = 0
+        n_final_output = 0
+        for idx in gts_per_image:
+            gt_boxes_i = gts_per_image[idx]
+            if not gt_boxes_i:
+                continue
+            tp_i, fp_i, fn_i, matched_i, fp_boxes_i = metrics.match_miss_false_alarm(
+                preds_per_image[idx], gt_boxes_i, thresh=0.3)
+            total_tp += tp_i
+            total_fp += fp_i
+            total_fn += fn_i
+
+            src_tag, _, stem, _, orig, _, _, _ = items[idx]
+            gt_panel = draw_boxes(orig, gt_boxes_i, GREEN)
+            pred_panel = draw_boxes(orig, matched_i + fp_boxes_i, ORANGE)
+            panel = np.hstack([gt_panel, pred_panel])
+            cv2.imwrite(str(final_output_dir / f"{src_tag}{stem}.png"), panel)
+            n_final_output += 1
+
+        LOGGER.info(f"final_test: {n_final_output} 張重疊圖 (左=GT 綠框，右=predict 橘框已合併) "
+                    f"存到 {final_output_dir}")
+        miss_rate = total_fn / (total_tp + total_fn) if (total_tp + total_fn) else 0.
+        false_alarm_rate = total_fp / (total_tp + total_fp) if (total_tp + total_fp) else 0.
+        LOGGER.info(f"final_test: Miss Rate = {miss_rate:.4f}, False Alarm Rate = {false_alarm_rate:.4f} "
+                    f"(coverage>=0.5 雙向判準, tp={total_tp} fp={total_fp} fn={total_fn})")
+
         extra_metrics = {
             "I-AUROC": img_ret["auroc"],
             "P-AUROC": pix_ret["auroc"],
             "P-PRO": pixel_pro,
             "AP@0.5(bbox)": detection_ap,
+            "Miss Rate": miss_rate,
+            "False Alarm": false_alarm_rate,
         }
 
         report_txt = pred_dir / "report.txt"
@@ -920,49 +993,52 @@ class MICE(torch.nn.Module):
             cv2.imwrite(str(wrong_dir / f"NG_{src_tag}{stem}.png"), panel)
         LOGGER.info(f"final_test: {n_wrong} 張判錯的圖存到 {wrong_dir}")
 
-        # ── 前景 mIoU 最高的 5 張，證明 bbox 圈得準不準 ────────────────
-        # IoU 用「清乾淨、過濾小雜訊後的 predict bbox」去算 (跟六聯圖畫出來的
-        # 框是同一份)，不是拿原始未過濾的 pixel mask 算，這樣數字才跟視覺化
-        # 對得起來。只對「本來就有 GT」的圖 (test/defect + other_fake 裡有
-        # 標到瑕疵的) 算，test/good 沒有前景可比，排除在外。
-        ious = []
-        for it, thr in zip(items, pix_thrs):
-            gt_bin = it[7] > 0
-            if not gt_bin.any():
-                ious.append(None)
+        # ── 「框得最好」的 10 張:2*miss_rate + false_alarm 最低 (分數越低越好)──
+        # 跟 group 層級的 Miss Rate/False Alarm 同一套 match_miss_false_alarm
+        # 判準，只是這裡是單張圖各自算，不是池化。直接重用前面已經算好的
+        # gts_per_image/preds_per_image (用最終 pix_thr 切出來的框)，不重算。
+        box_scores = []
+        for idx in range(len(items)):
+            gt_boxes_i = gts_per_image[idx]
+            if not gt_boxes_i:
+                box_scores.append(None)
                 continue
-            pred_bin_raw = (it[6] - thr) > 0
-            pred_boxes = mask_to_boxes(pred_bin_raw, clean=True)
-            pred_bin = boxes_to_mask(pred_boxes, gt_bin.shape)
-            inter = int(np.logical_and(pred_bin, gt_bin).sum())
-            union = int(np.logical_or(pred_bin, gt_bin).sum())
-            ious.append(inter / union if union > 0 else 0.)
+            tp, fp, fn, matched_i, fp_boxes_i = metrics.match_miss_false_alarm(
+                preds_per_image[idx], gt_boxes_i, thresh=0.3)
+            miss = fn / (tp + fn) if (tp + fn) else 0.
+            fa = fp / (tp + fp) if (tp + fp) else 0.
+            score = 2 * miss + fa
+            box_scores.append((score, miss, fa, tp, fp, fn, len(gt_boxes_i), len(preds_per_image[idx])))
 
-        valid = sorted([(i, v) for i, v in enumerate(ious) if v is not None],
-                       key=lambda x: -x[1])
-        top5 = valid[:5]
+        valid = sorted([(i, v) for i, v in enumerate(box_scores) if v is not None],
+                       key=lambda x: x[1][0])  # 分數越低(漏檢+誤報越少)排越前面
+        top10 = valid[:10]
 
-        bbox_dir = pred_dir / "bbox_top5"
+        # 統一收在 results_path/bbox_top10/<group_id>/，不是每個 group
+        # 各自散在 analyze results/<group_id>/ 底下，方便一次瀏覽所有 group 的結果。
+        bbox_dir = Path(self.results_path) / "bbox_top10" / group_id
         shutil.rmtree(bbox_dir, ignore_errors=True)
         bbox_dir.mkdir(parents=True, exist_ok=True)
-        top5_lines = []
-        for rank, (i, iou) in enumerate(top5, 1):
+        top10_lines = []
+        for rank, (i, (score, miss, fa, tp, fp, fn, n_gt, n_pred)) in enumerate(top10, 1):
             src_tag, lab, stem, _, orig, _, seg, gt_arr = items[i]
             panel = six_panel(orig, seg, gt_arr, pix_thrs[i])
-            cv2.imwrite(str(bbox_dir / f"{rank}_{iou:.3f}_{src_tag}{stem}.png"), panel)
-            top5_lines.append(f"  {rank}. {src_tag}{stem}   IoU = {iou:.4f}")
-        LOGGER.info(f"final_test: top5 bbox IoU 圖存到 {bbox_dir}")
+            cv2.imwrite(str(bbox_dir / f"{rank}_{score:.3f}_{src_tag}{stem}.png"), panel)
+            top10_lines.append(f"  {rank}. {src_tag}{stem}   2*miss+FA = {score:.4f}  "
+                               f"(miss={miss:.2f} fa={fa:.2f}, GT {n_gt} 框 / predict {n_pred} 框 / 配對成功 {tp})")
+        LOGGER.info(f"final_test: top10 bbox (2*miss+false_alarm 最低) 圖存到 {bbox_dir}")
 
         with open(report_txt, "a") as f:
             f.write("\n" + "-" * 72 + "\n")
-            f.write(f"TOP 5 BBOX (前景 mIoU 最高，共 {len(valid)} 張有 GT 可比較)\n")
+            f.write(f"TOP 10 BBOX (2*miss_rate+false_alarm 最低，共 {len(valid)} 張有 GT 可比較)\n")
             f.write("-" * 72 + "\n")
-            if top5_lines:
-                mean_iou = sum(v for _, v in valid) / len(valid)
-                f.write(f"mean IoU (全部有 GT 的圖) : {mean_iou:.4f}\n\n")
-                f.write("\n".join(top5_lines) + "\n")
+            if top10_lines:
+                mean_score = sum(v[0] for _, v in valid) / len(valid)
+                f.write(f"mean 2*miss+FA (全部有 GT 的圖) : {mean_score:.4f}  "
+                        f"(單張圖各自算，漏檢的懲罰是誤報的兩倍)\n\n")
+                f.write("\n".join(top10_lines) + "\n")
             else:
-                f.write("  (這個 group 沒有帶 GT 的圖，無法算 IoU)\n")
+                f.write("  (這個 group 沒有帶 GT 的圖，無法算)\n")
 
         return {"cls": cls, **extra_metrics, "n": len(items)}
 

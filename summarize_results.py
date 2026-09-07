@@ -73,6 +73,8 @@ def parse_report_txt(path: Path):
         "p_auroc": r"^P-AUROC\s*:\s*([\d.]+)",
         "p_pro": r"^P-PRO\s*:\s*([\d.]+)",
         "ap_bbox": r"^AP@0\.5\(bbox\)\s*:\s*([\d.]+)",
+        "miss_rate": r"^Miss Rate\s*:\s*([\d.]+)",
+        "false_alarm": r"^False Alarm\s*:\s*([\d.]+)",
         "wrong": r"^wrong predictions\s*:\s*(\d+)",
     }
     for key, pat in patterns.items():
@@ -135,13 +137,13 @@ def main():
     header = (f"{'group':<8} {'train':>6} {'test_g':>7} {'test_f':>7} {'other':>6} {'epoch':>6} | "
               f"{'cls_thr':>7} {'pix_thr':>7} | "
               f"{'acc':>7} {'bacc':>7} {'prec':>7} {'rec_f':>7} {'rec_g':>7} {'f1':>7} | "
-              f"{'I-AUROC':>8} {'P-AUROC':>8} {'P-PRO':>7} {'AP@.5':>7}")
+              f"{'I-AUROC':>8} {'P-AUROC':>8} {'P-PRO':>7} {'AP@.5':>7} {'Miss':>7} {'FalseAl':>8}")
     lines.append(header)
     lines.append("-" * len(header))
 
     agg = {"train": 0, "test_g": 0, "test_f": 0, "other": 0}
     reports = {}
-    auroc_vals, bacc_vals, f1_vals, ap_vals = [], [], [], []
+    auroc_vals, bacc_vals, f1_vals, ap_vals, miss_vals, fa_vals = [], [], [], [], [], []
 
     for gid in gids:
         g = args.data_path / gid
@@ -170,6 +172,10 @@ def main():
             f1_vals.append(float(f1) / 100)
         if report.get("ap_bbox"):
             ap_vals.append(float(report["ap_bbox"]) / 100)
+        if report.get("miss_rate"):
+            miss_vals.append(float(report["miss_rate"]) / 100)
+        if report.get("false_alarm"):
+            fa_vals.append(float(report["false_alarm"]) / 100)
 
         lines.append(
             f"{gid:<8} {fmt_count(n_train):>6} {fmt_count(n_test_g):>7} "
@@ -185,7 +191,9 @@ def main():
             f"{fpct(report.get('i_auroc'), '   N/A'):>8} "
             f"{fpct(report.get('p_auroc'), '   N/A'):>8} "
             f"{fpct(report.get('p_pro'), '   N/A'):>7} "
-            f"{fpct(report.get('ap_bbox'), '   N/A'):>7}"
+            f"{fpct(report.get('ap_bbox'), '   N/A'):>7} "
+            f"{fpct(report.get('miss_rate'), '   N/A'):>7} "
+            f"{fpct(report.get('false_alarm'), '   N/A'):>8}"
         )
 
     lines.append("-" * len(header))
@@ -199,6 +207,10 @@ def main():
         lines.append(f"  mean f1 (fake)         : {sum(f1_vals)/len(f1_vals)*100:.2f}%")
     if ap_vals:
         lines.append(f"  mean AP@0.5 (bbox)     : {sum(ap_vals)/len(ap_vals)*100:.2f}%")
+    if miss_vals:
+        lines.append(f"  mean Miss Rate         : {sum(miss_vals)/len(miss_vals)*100:.2f}%")
+    if fa_vals:
+        lines.append(f"  mean False Alarm       : {sum(fa_vals)/len(fa_vals)*100:.2f}%")
     lines.append("")
     lines.append("=" * 112)
     lines.append("欄位說明")
@@ -213,7 +225,11 @@ def main():
     lines.append("                            用 cls_thr 算出來的分類指標")
     lines.append("I-AUROC/P-AUROC/P-PRO     : 同一次 final_test，門檻無關的排序/分割指標")
     lines.append("AP@.5                     : Detection AP@IoU0.5 (bbox)，整個 group 一個數字的物件偵測")
-    lines.append("                            標準指標，不是單張圖的分數；bbox_top5/ 底下的 IoU 才是單張圖分數")
+    lines.append("                            標準指標，不是單張圖的分數；<group_id>_bbox_top10/ 底下的 box 配對 F1 才是單張圖分數")
+    lines.append("Miss/FalseAl              : Miss Rate/False Alarm，寬鬆判準——predict box 跟 GT box 雙向")
+    lines.append("                            coverage 都 >= 50% 才算配對成功 (不用框得準，但框太大/太偏配不上")
+    lines.append("                            一樣算錯)；漏檢的 GT 算 Miss，配不上任何 GT 的多餘框算 False Alarm，")
+    lines.append("                            重疊的重複框只算一次，整個 group 池化成一個數字")
     lines.append("")
 
     # ── 每個 group 的細節 (混淆矩陣) ──────────────────────────

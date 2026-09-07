@@ -220,6 +220,125 @@ def compute_detection_ap(predictions, gts_per_image, iou_thresh=0.5):
     return float(np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1]))
 
 
+def _box_coverage(box_a, box_b):
+    """box = (x, y, w, h)。回傳 intersection / box_a 面積。"""
+    ax, ay, aw, ah = box_a
+    bx, by, bw, bh = box_b
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    a_area = aw * ah
+    return inter / a_area if a_area > 0 else 0.
+
+
+def _boxes_touch(box_a, box_b):
+    """任何程度的重疊 (交集面積 > 0) 就算碰到。"""
+    ax, ay, aw, ah = box_a
+    bx, by, bw, bh = box_b
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    return (ix2 - ix1) > 0 and (iy2 - iy1) > 0
+
+
+def _cluster_indices(indices, boxes):
+    """把 indices 裡彼此有重疊 (碰到就算) 的分群，回傳 list of index-list。"""
+    idx_list = list(indices)
+    parent = {i: i for i in idx_list}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i in range(len(idx_list)):
+        for j in range(i + 1, len(idx_list)):
+            if _boxes_touch(boxes[idx_list[i]], boxes[idx_list[j]]):
+                union(idx_list[i], idx_list[j])
+
+    clusters = {}
+    for i in idx_list:
+        clusters.setdefault(find(i), []).append(i)
+    return list(clusters.values())
+
+
+def _union_box(boxes, indices):
+    """把一群框的外接矩形聯集起來，當作這群的代表框 (畫圖用，比只挑一個
+    更能表達「這坨雜訊實際涵蓋的範圍」)。"""
+    xs1 = [boxes[i][0] for i in indices]
+    ys1 = [boxes[i][1] for i in indices]
+    xs2 = [boxes[i][0] + boxes[i][2] for i in indices]
+    ys2 = [boxes[i][1] + boxes[i][3] for i in indices]
+    x1, y1, x2, y2 = min(xs1), min(ys1), max(xs2), max(ys2)
+    return (x1, y1, x2 - x1, y2 - y1)
+
+
+def match_miss_false_alarm(pred_boxes, gt_boxes, thresh=0.3):
+    """
+    回傳 (tp, fp, fn, matched_pred_boxes, fp_boxes) 給 miss rate / false alarm
+    rate 用，也給畫圖用。
+
+    跟 compute_detection_ap 的單向 IoU 配對不同，這裡刻意用寬鬆、雙向的
+    coverage 判準:「predict box 覆蓋 GT 面積 >= thresh」且「GT 覆蓋 predict
+    box 面積 >= thresh」同時成立才算配對候選 (兩邊都要夠，框太大或太小單獨
+    滿足一邊都不算——避免一個超大框隨便掃過去就騙過判準)。
+
+    逐一挑出目前品質最高 (兩方向 coverage 的較小值最大) 的候選配對當贏家，
+    清掉跟贏家有重疊 (碰到就算，不看重疊比例) 的其他 predict box —— 當作
+    同一個偵測的重複框，不計入 false alarm；但如果某個框對另一個「還沒
+    配對的 GT」自己也是合格候選，就保留給下一輪配對，不能清掉。重複整個
+    流程直到沒有合格候選為止。
+
+    最後剩下、沒配到任何 GT 的框，如果彼此還有重疊也要合併成一個 (聯集框)，
+    不能各自獨立算一次 false alarm (同一坨雜訊不該被拆成好幾筆誤報)。
+
+    matched_pred_boxes: 配對成功的贏家框列表。
+    fp_boxes: 配不到任何 GT、重疊的已合併成聯集框的誤報框列表。
+    """
+    remaining_pred = set(range(len(pred_boxes)))
+    unmatched_gt = set(range(len(gt_boxes)))
+    tp = 0
+    matched_pred_boxes = []
+
+    def is_candidate(pi, gi):
+        p, g = pred_boxes[pi], gt_boxes[gi]
+        return _box_coverage(g, p) >= thresh and _box_coverage(p, g) >= thresh
+
+    def quality(pi, gi):
+        p, g = pred_boxes[pi], gt_boxes[gi]
+        return min(_box_coverage(g, p), _box_coverage(p, g))
+
+    while True:
+        best = max(
+            ((quality(pi, gi), pi, gi) for gi in unmatched_gt for pi in remaining_pred
+             if is_candidate(pi, gi)),
+            default=None,
+        )
+        if best is None:
+            break
+        _, win_pi, win_gi = best
+        tp += 1
+        matched_pred_boxes.append(pred_boxes[win_pi])
+        unmatched_gt.discard(win_gi)
+        remaining_pred.discard(win_pi)
+
+        for pi in list(remaining_pred):
+            if _boxes_touch(pred_boxes[pi], pred_boxes[win_pi]):
+                still_useful = any(is_candidate(pi, gi) for gi in unmatched_gt)
+                if not still_useful:
+                    remaining_pred.discard(pi)
+
+    fn = len(unmatched_gt)
+    fp_clusters = _cluster_indices(remaining_pred, pred_boxes)
+    fp_boxes = [_union_box(pred_boxes, cluster) for cluster in fp_clusters]
+    return tp, len(fp_boxes), fn, matched_pred_boxes, fp_boxes
+
+
 def compute_pro(masks, amaps, num_th=200):
     # 每個門檻的結果先收在 list，最後一次組成 DataFrame。
     # 原本用 df.append 逐列累加，那個 API 已被 pandas 棄用，每次呼叫都會噴

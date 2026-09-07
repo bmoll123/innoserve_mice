@@ -32,6 +32,7 @@ python main.py \
     --test ckpt \
     --results_path results/0828/pcb_groups_k=0.25 \
     --visualize_all \
+    --min_box_area 300 \
   net \
     -b wideresnet50 \
     -le layer2 \

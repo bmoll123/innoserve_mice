@@ -29,6 +29,11 @@ import utils
                    "(單張圖 test_single_image.py 實測 12100/other_fake/163 選出來的值，"
                    "再往上到 400 沒有再濾掉東西)；如果還是有很多小框沒被濾掉就調大，"
                    "太多真的瑕疵被濾掉就調小。")
+@click.option("--pix_thr_mode", type=click.Choice(["f1", "minrisk"]), default="f1",
+              help="決定 predict_mask 二值化門檻怎麼選。f1 = pixel-level F1 準則，"
+                   "群組共用一顆，快。minrisk = 直接搜「讓 2*miss_rate+false_alarm 最低」"
+                   "的門檻，更貼近實際要優化的目標，但每個候選門檻(最多 500 個)都要對"
+                   "全部有 GT 的圖重新切框配對，明顯慢很多 (一個 group 可能要好幾分鐘)。")
 def main(**kwargs):
     pass
 
@@ -278,6 +283,7 @@ def run(
     test,
     visualize_all,
     min_box_area,
+    pix_thr_mode,
 ):
     methods = {key: item for (key, item) in methods}
 
@@ -339,6 +345,7 @@ def run(
                         test_ds.imgsize,
                         save_visualizations=visualize_all,
                         min_box_area=min_box_area,
+                        pix_thr_mode=pix_thr_mode,
                     )
 
                 result_collect.append(
