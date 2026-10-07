@@ -30,9 +30,10 @@ python main.py \
     --gpu 0 \
     --seed 0 \
     --test ckpt \
-    --results_path results/0828/pcb_groups_k=0.25 \
+    --results_path results/0908/delete_testgoodDefect_pcb_groups_k=0.25 \
     --visualize_all \
     --min_box_area 300 \
+    --exclude_val_good_pairs \
   net \
     -b wideresnet50 \
     -le layer2 \
@@ -53,12 +54,12 @@ python main.py \
     --thr_mode oracle_acc \
     --accum_images 8 \
   dataset \
-    --batch_size 4 \
+    --batch_size 1 \
     --resize 640 \
-    --imagesize 640 "${flags[@]}" mvtec $datapath 
+    --imagesize 640 "${flags[@]}" mvtec $datapath
   
 
-python summarize_results.py --results_path "results/0828/pcb_groups_k=0.25"
+python summarize_results.py --results_path "results/0908/delete_testgoodDefect_pcb_groups_k=0.25"
 
 # python main.py \
 #     --gpu 0 \

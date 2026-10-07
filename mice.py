@@ -640,7 +640,8 @@ class MICE(torch.nn.Module):
         return image_auroc, image_ap, pixel_auroc, pixel_ap, pixel_pro, epoch, cls["best_f1"], cls["best_f1_threshold"]
 
     def final_test(self, group_dir, group_id, resize, imagesize, save_visualizations=True,
-                   min_box_area=200, pix_thr_mode="f1"):
+                   min_box_area=200, pix_thr_mode="f1", exclude_val_good_pairs=False,
+                   dataset_layout="mice"):
         """
         最終測試:對 test/good + test/defect + other_fake「全部」圖跑一次推論，
         產生這個 group 的正式報告(取代舊的 visualize_all)。
@@ -686,6 +687,27 @@ class MICE(torch.nn.Module):
         來源縮寫: g=test/good, d=test/defect, o=other_fake。同一個 stem 在
         good/defect 之間可能重複 (範本圖跟它的瑕疵版本共用檔名)，所以檔名一定要
         帶來源縮寫，不能只用 id，否則會互相覆蓋。
+
+        exclude_val_good_pairs: 對應 main.py 的 --exclude_val_good_pairs。to_mice.py
+        產生資料時，同一個 stem 的範本 (temp/good) 和瑕疵版本 (test/defect 或
+        other_fake) 是同一塊 PCB 位置的成對影像，兩邊一定都各自輸出一份。而
+        val(訓練過程中用來校準門檻/挑 best ckpt)讀的就是 test/good+test/defect
+        這批圖，跟這裡 final_test 展開後的 test 是同一批圖的父集——用 val 選出來的
+        門檻/checkpoint 再套到同一批圖上算最終指標，等於用同樣的資料選模型又拿來
+        評分。開了這個 flag 後，會把 test/good 裡每個 stem 對應的 test/defect、
+        other_fake 圖直接排除，不納入這次 final_test，降低這種耦合。
+
+        dataset_layout: 'mice' (預設) 或 'yolo'。'yolo' 是給 deeppcb_yolo 那份
+        資料集用的——結構是 group_dir/test/good/image、group_dir/test/defect/
+        {image,label,origin_label}。label 是給 YOLO 訓練用的 txt (class cx cy
+        w h 正規化 0~1)，origin_label 是 prepare_deeppcb_yolo.py 從
+        deeppcb_mice 原始 mask png 直接複製過來的(不是從 txt box 還原，
+        避免正規化取整造成的誤差)，這裡讀的就是 origin_label。其餘邏輯
+        (門檻搜尋/AP/Miss Rate/bbox_top10/final_output)完全共用，不用另外
+        寫一份。deeppcb_yolo 的 test 已經是 val 加上 other_fake 扣掉被抽去
+        train/defect 的部分，這裡不用也不該再用 exclude_val_good_pairs
+        (那是給 deeppcb_mice 原始結構、且 train 真的被加了 test/good 圖時
+        才需要處理的洩漏)。
         """
         group_dir = Path(group_dir)
         pred_dir = Path(self.results_path) / "analyze results" / group_id
@@ -706,31 +728,56 @@ class MICE(torch.nn.Module):
         ])
 
         # (子資料夾, 對應的 GT mask 資料夾或 None=一律視為無瑕疵, 來源縮寫, image-level label)
-        sources = [
-            ("test/good", None, "g", 0),
-            ("test/defect", "ground_truth/defect", "d", 1),
-            ("other_fake", "other_fake_masks", "o", 1),
-        ]
+        if dataset_layout == "yolo":
+            sources = [
+                ("test/good/image", None, "g", 0),
+                ("test/defect/image", "test/defect/origin_label", "d", 1),
+            ]
+        else:
+            sources = [
+                ("test/good", None, "g", 0),
+                ("test/defect", "ground_truth/defect", "d", 1),
+                ("other_fake", "other_fake_masks", "o", 1),
+            ]
 
         self.forward_modules.eval()
         if self.pre_proj > 0:
             self.pre_projection.eval()
         self.discriminator.eval()
 
+        excluded_stems = set()
+        if exclude_val_good_pairs:
+            good_dir = group_dir / "test/good"
+            if good_dir.is_dir():
+                excluded_stems = {p.stem for p in good_dir.iterdir()
+                                  if p.suffix.lower() in (".jpg", ".jpeg", ".png")}
+
         # ── 第一階段: 跑推論，把結果都留著 (score + seg map + GT) ──────
         items = []  # (src_tag, label, stem, path, orig_bgr, score, seg_map, gt_arr)
+        n_excluded = 0
+        predict_times = []  # 純 self._predict() 單張耗時 (秒)，不含前處理/門檻計算
         for sub, mask_sub, src_tag, label in sources:
             img_dir = group_dir / sub
             if not img_dir.is_dir():
                 continue
             paths = sorted(p for p in img_dir.iterdir() if p.suffix.lower() in (".jpg", ".jpeg", ".png"))
+            if excluded_stems and sub != "test/good":
+                keep_paths = [p for p in paths if p.stem not in excluded_stems]
+                n_excluded += len(paths) - len(keep_paths)
+                paths = keep_paths
 
             for p in tqdm.tqdm(paths, desc=f"infer {sub}", leave=False):
                 pil_img = PIL.Image.open(p).convert("RGB")
                 img_t = img_tf(pil_img).unsqueeze(0)
 
+                if img_t.device.type == "cuda" or self.device.type == "cuda":
+                    torch.cuda.synchronize()
+                t0 = time.perf_counter()
                 with torch.no_grad():
                     score, seg = self._predict(img_t)
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize()
+                predict_times.append(time.perf_counter() - t0)
                 score = float(np.asarray(score).ravel()[0])
                 seg = seg[0]  # (H, W)，已經是 self.input_shape 的解析度
 
@@ -742,6 +789,18 @@ class MICE(torch.nn.Module):
 
                 orig = utils.torch_format_2_numpy_img(img_t[0].cpu().numpy())
                 items.append((src_tag, label, p.stem, str(p), orig, score, seg, gt_arr))
+
+        if exclude_val_good_pairs:
+            LOGGER.info(f"final_test: exclude_val_good_pairs 已排除 {n_excluded} 張瑕疵圖 "
+                        f"(跟被加進 train 的 test/good 同 stem，避免洩漏)")
+
+        if len(predict_times) > 3:
+            warm = predict_times[3:]  # 前 3 張通常有 CUDA/cudnn 暖機開銷，排除
+            mean_ms = float(np.mean(warm)) * 1000
+            median_ms = float(np.median(warm)) * 1000
+            LOGGER.info(f"final_test: 單張 inference (純 self._predict()，不含前處理/門檻搜尋) "
+                        f"mean={mean_ms:.2f}ms median={median_ms:.2f}ms "
+                        f"(n={len(warm)}，已排除前 3 張暖機)")
 
         if not items:
             LOGGER.info(f"final_test: {group_dir} 底下找不到圖")

@@ -34,6 +34,31 @@ import utils
                    "群組共用一顆，快。minrisk = 直接搜「讓 2*miss_rate+false_alarm 最低」"
                    "的門檻，更貼近實際要優化的目標，但每個候選門檻(最多 500 個)都要對"
                    "全部有 GT 的圖重新切框配對，明顯慢很多 (一個 group 可能要好幾分鐘)。")
+@click.option("--ckpt_source_path", type=str, default=None,
+              help="想沿用別的 results_path 底下已經練好的 checkpoint、但把這次的輸出"
+                   "(report.txt/final_output/bbox_top10...) 寫到目前 --results_path 這個"
+                   "新資料夾時用。給了這個才會去這個路徑底下找 models/backbone_.../ckpt_best_*，"
+                   "不給的話照舊用 --results_path 自己(也就是原本的行為，訓練/輸出同一個路徑)。"
+                   "常見情境: 想拿同一顆 checkpoint 對另一批 test 圖(例如 deeppcb_yolo 的 test)"
+                   "重新跑一次 final_test()，又不想覆蓋原本那份報告。")
+@click.option("--exclude_val_good_pairs", is_flag=True, default=False,
+              help="to_mice.py 產生資料時，同一個 stem 的範本(good)跟瑕疵版本"
+                   "(test/defect 或 other_fake)是同一塊 PCB 位置的成對影像，兩邊一定"
+                   "各自有輸出。開這個 flag 後，final_test() 評估時會把 test/good 每個"
+                   "stem 對應的 test/defect、other_fake 圖直接排除，避免驗證(val，"
+                   "跟 test/good+test/defect 共用同一批圖)跟最終測試互相洩漏答案。")
+@click.option("--final_test_data_path", type=str, default=None,
+              help="final_test() 讀圖的根目錄，不給就沿用 dataset command 的 data_path"
+                   "(原本的行為)。想拿同一顆 checkpoint 對另一份資料集的 test 評估時用，"
+                   "例如指到 /home/yuyun/Desktop/Innoserve/deeppcb_yolo——注意這只換"
+                   "final_test() 讀圖的路徑，train/tester() 那次驗證校準門檻用的還是"
+                   "dataset command 給的 data_path，兩者可以不同。")
+@click.option("--dataset_layout", type=click.Choice(["mice", "yolo"]), default="mice",
+              help="final_test() 讀圖的資料夾結構。mice = deeppcb_mice 那種"
+                   "(test/good、test/defect+ground_truth/defect、other_fake+"
+                   "other_fake_masks)。yolo = deeppcb_yolo 那種(test/good/image、"
+                   "test/defect/{image,origin_label})，通常搭配 --final_test_data_path"
+                   "指到 deeppcb_yolo 一起用。")
 def main(**kwargs):
     pass
 
@@ -284,6 +309,10 @@ def run(
     visualize_all,
     min_box_area,
     pix_thr_mode,
+    ckpt_source_path,
+    exclude_val_good_pairs,
+    final_test_data_path,
+    dataset_layout,
 ):
     methods = {key: item for (key, item) in methods}
 
@@ -312,7 +341,8 @@ def run(
         imagesize = dataloaders["training"].dataset.imagesize
         mice_list = methods["get_mice"](imagesize, device)
 
-        models_dir = os.path.join(run_save_path, "models")
+        ckpt_root = ckpt_source_path if ckpt_source_path else run_save_path
+        models_dir = os.path.join(ckpt_root, "models")
         os.makedirs(models_dir, exist_ok=True)
         for i, MICE in enumerate(mice_list):
             flag = 0.0, 0.0, 0.0, 0.0, 0.0, -1.0
@@ -338,14 +368,17 @@ def run(
 
                 if epoch > -1:
                     test_ds = dataloaders["testing"].dataset
+                    final_test_source = final_test_data_path if final_test_data_path else test_ds.source
                     MICE.final_test(
-                        os.path.join(test_ds.source, test_ds.classname),
+                        os.path.join(final_test_source, test_ds.classname),
                         test_ds.classname,
                         test_ds.resize,
                         test_ds.imgsize,
                         save_visualizations=visualize_all,
                         min_box_area=min_box_area,
                         pix_thr_mode=pix_thr_mode,
+                        exclude_val_good_pairs=exclude_val_good_pairs,
+                        dataset_layout=dataset_layout,
                     )
 
                 result_collect.append(
